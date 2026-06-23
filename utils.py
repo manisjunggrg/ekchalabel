@@ -573,7 +573,7 @@ def _tidy(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Text cleaning
+# 2. Text cleaning  +  Zone splitting
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STOPWORDS = {
@@ -598,24 +598,171 @@ def clean_text(text: str) -> str:
         return " ".join(t for t in text.split() if len(t) > 2 and t not in _STOPWORDS)
 
 
+# ── Zone classification ──────────────────────────────────────────────────────
+
+# Headers that signal the start of an ingredient list.
+_INGREDIENT_HEADERS = re.compile(
+    r"(?:ingredients|composition|made\s+(?:from|with))\s*[:\-]?",
+    re.IGNORECASE,
+)
+
+# Headers / keywords that signal a nutrition table.
+_NUTRITION_HEADERS = re.compile(
+    r"(?:nutrition\s*(?:facts|information|value|per)|amount\s+per|daily\s+value|"
+    r"per\s+(?:serving|\d+\s*[gm]l?)|valeur\s+nutritive)",
+    re.IGNORECASE,
+)
+
+# A line is "nutritional" if it contains a nutrient keyword followed by a
+# number, typical of table rows like "Total Fat 24g" or "Sodium 480 mg".
+_NUTRITION_ROW = re.compile(
+    r"(?:energy|calories?|kcal|total\s*fat|trans\s*fat|saturated|cholesterol|"
+    r"sodium|salt|carbohydrate|sugar|fibre|fiber|protein|vitamin|calcium|"
+    r"iron|potassium|daily\s*value|serving|amount)[^\n]{0,30}\d",
+    re.IGNORECASE,
+)
+
+
+class TextZones:
+    """OCR text split into functional zones of a product label."""
+    __slots__ = ("nutrition", "ingredients", "other", "full")
+
+    def __init__(self, nutrition: str, ingredients: str, other: str, full: str):
+        self.nutrition = nutrition      # text from nutrition facts table
+        self.ingredients = ingredients  # text from ingredient list
+        self.other = other              # everything else (brand, instructions …)
+        self.full = full
+
+    @property
+    def for_ingredient_matching(self) -> str:
+        """
+        Text used for ingredient detection.
+
+        Uses ingredient zone + other zone (i.e. everything EXCEPT the
+        nutrition table). This handles labels that don't have an
+        "Ingredients:" header — the comma-separated list just sits in
+        'other' — while still excluding nutrition-table rows.
+        """
+        parts = []
+        if self.ingredients.strip():
+            parts.append(self.ingredients)
+        if self.other.strip():
+            parts.append(self.other)
+        return "\n".join(parts) if parts else self.full
+
+    @property
+    def for_nutrition_parsing(self) -> str:
+        """Text that should be used for nutrition value parsing."""
+        if self.nutrition.strip():
+            return self.nutrition
+        return self.full
+
+
+def split_text_zones(text: str) -> TextZones:
+    """
+    Split OCR text into nutrition-table, ingredient-list and other zones.
+
+    This is critical to prevent words like "sugar", "sodium", "trans fat",
+    "cholesterol" from the nutrition table being falsely flagged as
+    harmful *ingredients*.
+
+    Heuristic (line by line):
+    1. Lines after an "Ingredients:" header → ingredient zone
+       (until the next recognisable header or a blank line).
+    2. Lines matching nutrition table patterns (header or data rows
+       like "Total Fat 24g") → nutrition zone.
+    3. Everything else → other zone.
+    """
+    lines = text.split("\n")
+    nut_lines: list[str] = []
+    ing_lines: list[str] = []
+    other_lines: list[str] = []
+
+    zone = "other"   # current zone state machine
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if zone == "ingredients":
+                zone = "other"  # blank line ends ingredient list
+            continue
+
+        # Check for zone-starting headers.
+        if _INGREDIENT_HEADERS.search(stripped):
+            zone = "ingredients"
+            # The header line itself may contain ingredients after the colon.
+            after_colon = re.split(r"[:;\-]\s*", stripped, maxsplit=1)
+            if len(after_colon) > 1 and after_colon[1].strip():
+                ing_lines.append(after_colon[1].strip())
+            continue
+
+        if _NUTRITION_HEADERS.search(stripped):
+            zone = "nutrition"
+            continue
+
+        # Within the ingredient zone, keep accumulating.
+        if zone == "ingredients":
+            ing_lines.append(stripped)
+            continue
+
+        # Check if line looks like a nutrition table row.
+        if _NUTRITION_ROW.search(stripped):
+            nut_lines.append(stripped)
+            zone = "nutrition"
+            continue
+
+        # If we were in nutrition mode but this line doesn't match,
+        # the nutrition table has ended — fall through to other.
+        if zone == "nutrition":
+            zone = "other"
+
+        # Default: other.
+        other_lines.append(stripped)
+
+    return TextZones(
+        nutrition="\n".join(nut_lines),
+        ingredients="\n".join(ing_lines),
+        other="\n".join(other_lines),
+        full=text,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Ingredient detection (dataset-driven)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_ingredients(text: str) -> list[dict]:
     """
-    Match dataset ingredients against raw OCR text; returns metadata dicts.
+    Match dataset ingredients against text; returns metadata dicts.
 
     Matchers are processed longest-first and claim character spans, so a
     shorter fragment fully inside an already-matched longer term (e.g.
     "flavor" inside "artificial flavor") is suppressed.
+
+    IMPORTANT: pass only the *ingredient-zone* text (not the nutrition
+    table) to avoid false positives from nutrient names.
     """
     matchers, meta = _build_index()
     haystack = " " + text.lower() + " "
     found: dict[str, dict] = {}
     claimed: list[tuple[int, int]] = []
+
+    # Terms that are nutrient / table labels, not meaningful ingredients.
+    # Even if they appear in the ingredient zone, flagging "sugar" as a
+    # harmful ingredient is misleading — it's too generic.
+    _NUTRIENT_NOISE = {
+        "sugar", "sugars", "sodium", "cholesterol", "fat", "trans fat",
+        "saturated fat", "total fat", "calories", "protein", "carbohydrate",
+        "carbohydrates", "fibre", "fiber", "energy",
+        # Generic words that appear on labels but aren't specific ingredients:
+        "powder", "soup", "flavors", "flavor", "colour", "color",
+        "extract", "concentrate", "blend",
+    }
+
     for name, pattern in matchers:
         if name in found:
+            continue
+        if name in _NUTRIENT_NOISE:
             continue
         for mt in pattern.finditer(haystack):
             s, e = mt.span()
@@ -845,3 +992,52 @@ def generate_explanation(score: int, risk: str, detected: list[dict],
     lines.append("> *Educational analysis only. Consult a qualified nutritionist for personal advice.*")
 
     return "\n\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. High-level pipeline (zone-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LabelAnalysis:
+    """All results from analysing a single label image."""
+    __slots__ = (
+        "zones", "detected", "harmful", "nutrition",
+        "score", "grade", "risk", "h_cnt", "c_cnt", "s_cnt",
+    )
+
+    def __init__(self):
+        self.zones: Optional[TextZones] = None
+        self.detected: list[dict] = []
+        self.harmful: list[str] = []
+        self.nutrition: dict[str, float] = {}
+        self.score: int = 50
+        self.grade: str = "C"
+        self.risk: str = "⚠️ Moderate"
+        self.h_cnt = self.c_cnt = self.s_cnt = 0
+
+
+def analyze_label(raw_text: str) -> LabelAnalysis:
+    """
+    Full zone-aware analysis pipeline.
+
+    1. Split OCR text into nutrition / ingredient / other zones.
+    2. Parse nutrition only from the nutrition zone.
+    3. Match ingredients only from the ingredient zone.
+    4. Compute score from both signals.
+    """
+    a = LabelAnalysis()
+    a.zones = split_text_zones(raw_text)
+
+    # Parse nutrition from nutrition zone (not full text).
+    a.nutrition = parse_nutritional_values(a.zones.for_nutrition_parsing)
+
+    # Match ingredients from ingredient zone (not nutrition table).
+    a.detected = detect_ingredients(a.zones.for_ingredient_matching)
+    a.harmful = [d["ingredient"] for d in a.detected
+                 if d["classification"] in ("harmful", "caution")]
+    a.h_cnt, a.c_cnt, a.s_cnt = count_concerns(a.detected)
+
+    a.score = compute_score(a.detected, a.nutrition)
+    a.grade = get_grade(a.score)
+    a.risk = classify_health(a.score)
+    return a
