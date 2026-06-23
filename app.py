@@ -5,6 +5,7 @@ import streamlit as st
 from PIL import Image
 
 from utils import (
+    OCRResult,
     available_engines,
     classify_health,
     clean_text,
@@ -12,13 +13,15 @@ from utils import (
     count_concerns,
     detect_harmful_ingredients,
     detect_ingredients,
-    extract_text,
+    draw_ocr_overlay,
+    extract_text_with_overlay,
     generate_explanation,
     get_grade,
     load_ingredient_db,
     nova_label,
     ocrspace_key_configured,
     parse_nutritional_values,
+    _is_nutrition_line,
 )
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -183,8 +186,11 @@ with left:
     st.image(image, caption="Input image", use_container_width=True)
 
 with right:
-    with st.spinner(f"🔍 Running OCR ({engine}) …"):
-        raw_text = extract_text(image, languages=lang_choice, engine=engine, preprocess=preprocess)
+    with st.spinner(f"🔍 Running OCR ({engine}) — dual-engine with overlay …"):
+        ocr_result: OCRResult = extract_text_with_overlay(
+            image, languages=lang_choice, engine=engine, preprocess=preprocess,
+        )
+        raw_text = ocr_result.text
 
     if not raw_text.strip():
         st.warning("⚠️ No text extracted. Try a sharper image, or switch OCR engine in the sidebar.")
@@ -224,8 +230,76 @@ if show_raw:
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["⚠️ Flagged", "🧪 All ingredients", "📈 Nutrition", "💬 Verdict"])
+tab_ocr, tab1, tab2, tab3, tab4 = st.tabs(
+    ["🔍 OCR Debug", "⚠️ Flagged", "🧪 All ingredients", "📈 Nutrition", "💬 Verdict"])
+
+# Tab 0 — OCR Debug: annotated image + line-by-line text
+with tab_ocr:
+    st.subheader("OCR text detection — what the engine reads")
+    st.caption(
+        "🟩 **Green boxes** = nutrition-related lines · "
+        "🟦 **Blue boxes** = other text (ingredients, brand, etc.)"
+    )
+
+    ocr_left, ocr_right = st.columns([1.2, 1], gap="large")
+    with ocr_left:
+        if ocr_result.annotated_image is not None:
+            st.image(ocr_result.annotated_image, caption="Annotated — detected text regions",
+                     use_container_width=True)
+        else:
+            st.info("Bounding-box overlay is only available with the OCR.space engine.")
+            st.image(image, caption="Original image (no overlay)", use_container_width=True)
+
+    with ocr_right:
+        st.markdown("##### Extracted lines")
+        if ocr_result.lines:
+            nut_lines = []
+            other_lines = []
+            for ln in ocr_result.lines:
+                if not ln.text.strip():
+                    continue
+                if _is_nutrition_line(ln.text):
+                    nut_lines.append(ln)
+                else:
+                    other_lines.append(ln)
+
+            if nut_lines:
+                st.markdown(f"**🟩 Nutrition facts ({len(nut_lines)} lines)**")
+                for ln in nut_lines:
+                    conf_str = f" · conf {ln.confidence:.0f}%" if ln.confidence else ""
+                    eng_str = f" [{ln.engine}]" if ln.engine else ""
+                    st.markdown(
+                        f'<div style="background:#ecfdf5;border-left:4px solid #22c55e;'
+                        f'padding:4px 10px;margin:3px 0;border-radius:6px;font-size:.88rem">'
+                        f'{ln.text} <span style="color:#6b7280;font-size:.72rem">'
+                        f'{conf_str}{eng_str}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+            if other_lines:
+                st.markdown(f"**🟦 Other text ({len(other_lines)} lines)**")
+                for ln in other_lines:
+                    conf_str = f" · conf {ln.confidence:.0f}%" if ln.confidence else ""
+                    eng_str = f" [{ln.engine}]" if ln.engine else ""
+                    st.markdown(
+                        f'<div style="background:#eff6ff;border-left:4px solid #3b82f6;'
+                        f'padding:4px 10px;margin:3px 0;border-radius:6px;font-size:.88rem">'
+                        f'{ln.text} <span style="color:#6b7280;font-size:.72rem">'
+                        f'{conf_str}{eng_str}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+        else:
+            st.warning("No lines with bounding data available.")
+
+    # Summary stats
+    total_lines = len([ln for ln in ocr_result.lines if ln.text.strip()])
+    nut_count = sum(1 for ln in ocr_result.lines if ln.text.strip() and _is_nutrition_line(ln.text))
+    st.markdown("---")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Total lines", total_lines)
+    sc2.metric("Nutrition lines", nut_count)
+    sc3.metric("Other lines", total_lines - nut_count)
+    sc4.metric("Characters", len(raw_text))
 
 with tab1:
     st.subheader("Ingredients to avoid or limit")
