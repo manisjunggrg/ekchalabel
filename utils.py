@@ -211,47 +211,267 @@ def _ocrspace_key() -> Optional[str]:
         return key
     try:
         import streamlit as st
-        return st.secrets.get("OCR_SPACE_API_KEY")  # set in Cloud → Settings → Secrets
+        return st.secrets.get("OCR_SPACE_API_KEY")
     except Exception:
         return None
 
 
-def _ocr_ocrspace(image: Image.Image, languages: list[str], preprocess: bool) -> str:
-    """
-    Cloud OCR via the OCR.space API. Ideal for Streamlit Community Cloud:
-    accurate on photos, runs server-side, negligible app memory.
+# ── OCR result container ─────────────────────────────────────────────────────
 
-    Needs an API key (free tier, no card) in env `OCR_SPACE_API_KEY` or in
-    Streamlit secrets. Falls back to the public demo key if none is set.
+class OCRLine:
+    """A single line recognised by OCR, with its bounding box."""
+    __slots__ = ("text", "bbox", "confidence", "engine")
+
+    def __init__(self, text: str, bbox: tuple | None = None,
+                 confidence: float = 0.0, engine: str = ""):
+        self.text = text
+        self.bbox = bbox          # (x, y, w, h) in image pixels
+        self.confidence = confidence
+        self.engine = engine
+
+    def __repr__(self):
+        return f"OCRLine({self.text!r}, bbox={self.bbox})"
+
+
+class OCRResult:
+    """Full OCR output: raw text + per-line bounding boxes + annotated image."""
+    def __init__(self):
+        self.lines: list[OCRLine] = []
+        self.annotated_image: Optional[Image.Image] = None
+        self._scale: float = 1.0  # preprocessing scale factor
+
+    @property
+    def text(self) -> str:
+        return "\n".join(ln.text for ln in self.lines if ln.text.strip())
+
+
+# ── Nutrition-keyword set for colour-coding boxes ────────────────────────────
+
+_NUTRITION_KEYWORDS = {
+    "energy", "calories", "kcal", "cal", "kj", "fat", "saturated",
+    "carbohydrate", "carbohydrates", "sugar", "sugars", "fibre", "fiber",
+    "protein", "sodium", "salt", "cholesterol", "serving", "amount",
+    "daily", "value", "nutrition", "nutritional", "facts", "per",
+    "total", "trans", "vitamin", "iron", "calcium", "potassium",
+}
+
+
+def _is_nutrition_line(text: str) -> bool:
+    """Heuristic: does the line look like part of a nutrition table?"""
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    # Nutrition lines typically contain a keyword + a number
+    has_keyword = bool(words & _NUTRITION_KEYWORDS)
+    has_number = bool(re.search(r"\d", text))
+    return has_keyword and has_number
+
+
+# ── Better preprocessing ─────────────────────────────────────────────────────
+
+def _prepare_for_cloud_ocr(image: Image.Image) -> tuple[Image.Image, float]:
     """
+    Aggressively enhance a photographed label for cloud OCR.
+    Returns (enhanced_image, scale_factor).
+    """
+    from PIL import ImageEnhance
+
+    img = image.copy()
+    w, h = img.size
+
+    # Upscale to ~2500px on the long side for maximum text resolution.
+    target = 2500
+    if max(w, h) < target:
+        scale = target / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    else:
+        scale = 1.0
+
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Contrast(img).enhance(1.4)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    return img, scale
+
+
+def _shrink_for_upload(image: Image.Image, max_bytes: int = 1_000_000) -> bytes:
+    """JPEG-encode, shrinking quality until it fits under the API size limit."""
+    import io
+    for quality in (88, 75, 60, 45):
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        if buf.tell() <= max_bytes:
+            return buf.getvalue()
+        # Also try resizing down
+        if quality <= 60:
+            w, h = image.size
+            image = image.resize((int(w * 0.8), int(h * 0.8)), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=40)
+    return buf.getvalue()
+
+
+# ── OCR.space dual-engine with bounding boxes ────────────────────────────────
+
+def _ocrspace_call(image_bytes: bytes, engine_id: int, key: str) -> dict:
+    """Single OCR.space API call. Returns the raw JSON response."""
     import io
     import requests
 
-    key = _ocrspace_key() or "helloworld"  # demo key: heavily rate-limited
-
-    work = _enhance_colour(image) if preprocess else image
-    # Keep the upload comfortably under the 1 MB free-tier limit.
-    if max(work.size) > 2000:
-        s = 2000 / max(work.size)
-        work = work.resize((int(work.size[0] * s), int(work.size[1] * s)), Image.LANCZOS)
-    buf = io.BytesIO()
-    work.save(buf, format="JPEG", quality=80)
-    buf.seek(0)
-
-    # OCR Engine 2 reads photographed text best (Latin scripts).
     resp = requests.post(
         "https://api.ocr.space/parse/image",
-        files={"label.jpg": ("label.jpg", buf, "image/jpeg")},
-        data={"language": "eng", "OCREngine": 2, "scale": True,
-              "isOverlayRequired": False, "apikey": key},
-        timeout=40,
+        files={"label.jpg": ("label.jpg", io.BytesIO(image_bytes), "image/jpeg")},
+        data={
+            "language": "eng",
+            "OCREngine": engine_id,
+            "scale": True,
+            "isOverlayRequired": True,
+            "apikey": key,
+        },
+        timeout=45,
     )
     resp.raise_for_status()
-    data = resp.json()
-    if data.get("OCRExitCode") not in (1, 2):
-        raise RuntimeError(data.get("ErrorMessage") or "OCR.space request failed")
-    return "\n".join(r.get("ParsedText", "") for r in data.get("ParsedResults", []))
+    return resp.json()
 
+
+def _parse_ocrspace_overlay(data: dict, engine_label: str) -> list[OCRLine]:
+    """Parse OCR.space overlay JSON into OCRLine objects."""
+    lines_out: list[OCRLine] = []
+    for pr in data.get("ParsedResults", []):
+        overlay = pr.get("TextOverlay", {})
+        for api_line in overlay.get("Lines", []):
+            words = api_line.get("Words", [])
+            if not words:
+                continue
+            text = " ".join(w["WordText"] for w in words)
+            # Build a bounding box that encloses all words on this line.
+            xs = [w["Left"] for w in words]
+            ys = [w["Top"] for w in words]
+            x2s = [w["Left"] + w["Width"] for w in words]
+            y2s = [w["Top"] + w["Height"] for w in words]
+            bbox = (min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys))
+            conf = np.mean([w.get("Confidence", 0) for w in words]) if words else 0
+            lines_out.append(OCRLine(text, bbox, confidence=conf, engine=engine_label))
+    return lines_out
+
+
+def _merge_lines(lines1: list[OCRLine], lines2: list[OCRLine]) -> list[OCRLine]:
+    """
+    Merge OCR lines from two engines. Keep both unless they substantially
+    overlap (same text in nearly the same location), in which case keep the
+    higher-confidence one.
+    """
+    merged: list[OCRLine] = list(lines1)
+    seen_texts = {ln.text.strip().lower() for ln in lines1}
+    for ln in lines2:
+        key = ln.text.strip().lower()
+        if key in seen_texts:
+            continue  # duplicate text already covered
+        merged.append(ln)
+        seen_texts.add(key)
+    # Sort top-to-bottom by vertical position of the bbox.
+    merged.sort(key=lambda ln: (ln.bbox[1] if ln.bbox else 0))
+    return merged
+
+
+def _ocr_ocrspace_with_overlay(
+    image: Image.Image, languages: list[str], preprocess: bool,
+) -> OCRResult:
+    """
+    Run OCR.space Engine 1 (structured / table text) AND Engine 2 (photo text),
+    merge results, and return bounding boxes for annotation.
+    """
+    key = _ocrspace_key() or "helloworld"
+
+    work, scale = _prepare_for_cloud_ocr(image) if preprocess else (image, 1.0)
+    img_bytes = _shrink_for_upload(work)
+
+    result = OCRResult()
+    result._scale = scale
+
+    # ── Engine 2 first (better on photographed / curved text) ────────────
+    try:
+        data2 = _ocrspace_call(img_bytes, engine_id=2, key=key)
+        if data2.get("OCRExitCode") in (1, 2):
+            lines2 = _parse_ocrspace_overlay(data2, "E2-photo")
+        else:
+            lines2 = []
+    except Exception:
+        lines2 = []
+
+    # ── Engine 1 (better on structured tables like nutrition facts) ──────
+    try:
+        data1 = _ocrspace_call(img_bytes, engine_id=1, key=key)
+        if data1.get("OCRExitCode") in (1, 2):
+            lines1 = _parse_ocrspace_overlay(data1, "E1-table")
+        else:
+            lines1 = []
+    except Exception:
+        lines1 = []
+
+    # Merge: Engine 2 as base (photo-focused), add unique lines from Engine 1.
+    result.lines = _merge_lines(lines2, lines1)
+    return result
+
+
+def _ocr_ocrspace(image: Image.Image, languages: list[str], preprocess: bool) -> str:
+    """Backwards-compatible wrapper returning plain text."""
+    return _ocr_ocrspace_with_overlay(image, languages, preprocess).text
+
+
+# ── Draw bounding boxes on image ─────────────────────────────────────────────
+
+def draw_ocr_overlay(
+    image: Image.Image,
+    ocr_result: OCRResult,
+    box_width: int = 2,
+) -> Image.Image:
+    """
+    Draw bounding boxes on the image. Returns an annotated copy.
+
+    Colours:
+        🟩 Green  — nutrition-related lines (energy, fat, sugar …)
+        🟦 Blue   — other text (ingredients, brand, etc.)
+    Boxes are scaled back from the preprocessing resolution to the original.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    annotated = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(annotated)
+    scale = ocr_result._scale
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                  max(10, int(image.height * 0.012)))
+    except Exception:
+        font = ImageFont.load_default()
+
+    for ln in ocr_result.lines:
+        if not ln.bbox or not ln.text.strip():
+            continue
+        x, y, w, h = ln.bbox
+        # Scale bbox back to original image coordinates.
+        x, y, w, h = x / scale, y / scale, w / scale, h / scale
+        is_nut = _is_nutrition_line(ln.text)
+        colour = (34, 197, 94) if is_nut else (59, 130, 246)       # green / blue
+        fill_bg = (34, 197, 94, 35) if is_nut else (59, 130, 246, 35)
+
+        # Draw filled semi-transparent rectangle + outline.
+        overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        overlay_draw.rectangle([x, y, x + w, y + h], fill=fill_bg)
+        annotated = Image.alpha_composite(annotated.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(annotated)
+        draw.rectangle([x, y, x + w, y + h], outline=colour, width=box_width)
+
+        # Label the box.
+        label = "NUT" if is_nut else ""
+        if label:
+            tw = draw.textlength(label, font=font)
+            draw.rectangle([x, y - 14, x + tw + 6, y], fill=colour)
+            draw.text((x + 3, y - 13), label, fill="white", font=font)
+
+    return annotated
+
+
+# ── Engine registry (updated) ────────────────────────────────────────────────
 
 _ENGINES = {
     "ocrspace": _ocr_ocrspace,
@@ -259,15 +479,12 @@ _ENGINES = {
     "easyocr": _ocr_easy,
     "tesseract": _ocr_tesseract,
 }
-# Streamlit-Cloud-friendly order: cloud OCR (light + accurate) → local deep
-# engines (if installed) → Tesseract fallback.
 _AUTO_ORDER = ["ocrspace", "paddleocr", "easyocr", "tesseract"]
 
 
 def available_engines() -> list[str]:
     """Return OCR engines that can actually run in this environment."""
     found = []
-    # Cloud engine: needs `requests`; usable with a key (or demo key).
     try:
         import requests  # noqa: F401
         found.append("ocrspace")
@@ -288,6 +505,50 @@ def ocrspace_key_configured() -> bool:
     return bool(_ocrspace_key())
 
 
+def extract_text_with_overlay(
+    image: Image.Image,
+    languages: Optional[list[str]] = None,
+    engine: str = "auto",
+    preprocess: bool = True,
+) -> OCRResult:
+    """
+    Full OCR pipeline returning text + bounding boxes + annotated image.
+    Falls through engines just like extract_text().
+    """
+    if languages is None:
+        languages = ["en"]
+
+    order = _AUTO_ORDER if engine == "auto" else [engine]
+    last_err: Optional[Exception] = None
+
+    for name in order:
+        try:
+            if name == "ocrspace":
+                result = _ocr_ocrspace_with_overlay(image, languages, preprocess)
+                if result.lines:
+                    result.annotated_image = draw_ocr_overlay(image, result)
+                    return result
+            else:
+                fn = _ENGINES.get(name)
+                if fn is None:
+                    continue
+                text = fn(image, languages, preprocess)
+                if text and text.strip():
+                    # Non-ocrspace engines don't have overlay; wrap in OCRResult.
+                    result = OCRResult()
+                    for line in text.split("\n"):
+                        if line.strip():
+                            result.lines.append(OCRLine(line.strip(), engine=name))
+                    return result
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err and engine != "auto":
+        raise last_err
+    return OCRResult()
+
+
 def extract_text(
     image: Image.Image,
     languages: Optional[list[str]] = None,
@@ -302,25 +563,7 @@ def extract_text(
     On Streamlit Cloud, "ocrspace" (cloud) is the most reliable accurate
     option; local deep engines are heavy and Tesseract is weak on photos.
     """
-    if languages is None:
-        languages = ["en"]
-
-    order = _AUTO_ORDER if engine == "auto" else [engine]
-    last_err: Optional[Exception] = None
-    for name in order:
-        fn = _ENGINES.get(name)
-        if fn is None:
-            continue
-        try:
-            text = fn(image, languages, preprocess)
-            if text and text.strip():
-                return _tidy(text)
-        except Exception as e:  # missing package / runtime error → try next
-            last_err = e
-            continue
-    if last_err and engine != "auto":
-        raise last_err
-    return ""
+    return extract_text_with_overlay(image, languages, engine, preprocess).text
 
 
 def _tidy(text: str) -> str:
