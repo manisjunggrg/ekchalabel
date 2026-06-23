@@ -1,19 +1,6 @@
-# ── Streamlit Community Cloud build (kept light to fit the ~1 GB tier) ──
 streamlit>=1.36
 pillow
 numpy
 pandas
 plotly
-requests            # OCR.space cloud OCR (recommended on Streamlit Cloud)
-pytesseract         # local fallback OCR (uses tesseract from packages.txt)
-opencv-python-headless
-
-# Optional NLP cleaning (app falls back to regex if missing)
-spacy
-
-# ── DO NOT enable these on Streamlit Community Cloud free tier ──
-# They are large and commonly fail to build or run out of memory there.
-# Use them only for LOCAL or Docker runs:
-# easyocr           # pulls in torch (~large); borderline on 1 GB RAM
-# paddleocr
-# paddlepaddle      # frequently fails to build on Streamlit Cloud
+surya-ocr>=0.16,<0.17
