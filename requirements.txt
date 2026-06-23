@@ -9,3 +9,12 @@ seaborn>=0.13.0
 spacy>=3.7.0
 torch>=2.2.0
 Pillow>=10.2.0
+streamlit>=1.36
+pillow
+numpy
+pandas
+plotly
+pytesseract
+opencv-python-headless
+# Optional: better NLP cleaning. The app falls back to regex if absent.
+spacy
