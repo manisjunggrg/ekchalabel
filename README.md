@@ -1,69 +1,41 @@
 # e-K Cha Label? — FMCG Label Analyzer
 
-Scan a product label → OCR → match against the ~8.7k-ingredient **EatSafe**
-database → health score (0–100), Nutri-grade, NOVA processing level and a
-plain-language verdict.
+Scan a product label → **Gemini Vision** reads it → ingredients matched
+against 8.7k EatSafe database → health score + verdict.
+
+## Why Gemini Vision instead of OCR?
+
+Traditional OCR (Tesseract, EasyOCR, PaddleOCR, OCR.space) **cannot reliably
+read photographed product labels** — curved text, glare, small fonts, and
+complex table layouts break them. Layering regex on top of broken OCR
+compounds the problem.
+
+**Gemini Flash Vision** solves both problems at once:
+- Reads text from photos accurately (it's a vision-language model, not OCR)
+- Extracts **structured data directly** — nutrient names, values, units,
+  ingredient lists — as JSON. No regex parsing needed.
+- Lightweight API call, works perfectly on Streamlit Cloud's free tier.
 
 ## Files
-- `app.py` — Streamlit UI
-- `utils.py` — OCR (dual-engine + overlay), ingredient matching, scoring, verdict
-- `eatsafe_master_database.csv` — ingredient knowledge base (8,752 items)
-- `requirements.txt` / `packages.txt` — dependencies
+| File | Purpose |
+|------|---------|
+| `app.py` | Streamlit UI |
+| `utils.py` | Gemini extraction, dataset matching, scoring |
+| `eatsafe_master_database.csv` | 8,752-ingredient knowledge base |
+| `requirements.txt` | Pip dependencies (6 packages, all lightweight) |
 
-## OCR pipeline
+## Deploy on Streamlit Community Cloud
 
-### The problem with Tesseract
-Tesseract is built for clean scans. It is unreliable on photographed labels
-(curved text, shadows, uneven lighting). That is why earlier versions
-struggled to extract text.
-
-### Solution: OCR.space dual-engine with bounding boxes
-The app calls the **OCR.space** cloud API (free tier, no credit card) which
-runs deep-learning OCR on their server — accurate on real photos and uses
-almost no app memory:
-
-| Engine | Strength |
-|--------|----------|
-| **OCR.space Engine 2** | Best on photographed / curved text |
-| **OCR.space Engine 1** | Best on structured tables (nutrition facts) |
-
-Both engines run; their results are **merged and deduplicated**. The API also
-returns **word-level bounding boxes**, which the app draws on the image:
-
-- 🟩 **Green** boxes — nutrition-related lines (Energy, Fat, Sugar …)
-- 🟦 **Blue** boxes — other text (ingredients, brand name, etc.)
-
-The **🔍 OCR Debug** tab shows the annotated image beside a line-by-line
-readout so you can immediately see what was read, what was missed, and which
-lines are nutrition vs ingredients.
-
-If OCR.space is unavailable the app falls back to Tesseract (installed via
-`packages.txt`). PaddleOCR / EasyOCR can be enabled for local runs but are
-too heavy for Streamlit Cloud's 1 GB free tier.
-
-## Deploying on Streamlit Community Cloud
-
-1. Get a free API key (no credit card) at https://ocr.space/ocrapi
-2. In your app on Streamlit Cloud → **Settings → Secrets**, add:
+1. Get a free Gemini API key at https://aistudio.google.com/apikey
+2. In your Streamlit Cloud app → **Settings → Secrets**, add:
    ```toml
-   OCR_SPACE_API_KEY = "your_key_here"
+   GOOGLE_API_KEY = "your_key_here"
    ```
-3. Deploy. `requirements.txt` and `packages.txt` are already Cloud-safe.
-
-`packages.txt` lists only `tesseract-ocr` + `tesseract-ocr-eng` (the fallback
-engine). Do **not** add `libgl1` / `libglib2.0-0` — `opencv-python-headless`
-needs no system GL libs, and pinning glib breaks the apt solver on Streamlit
-Cloud's Debian image.
-
-Without a key the app uses OCR.space's public demo key — works but is
-heavily rate-limited (fine for a quick test, not for a demo day).
+3. Push and deploy. No `packages.txt` system deps needed.
 
 ## Run locally
 ```bash
 pip install -r requirements.txt
-export OCR_SPACE_API_KEY=your_key   # recommended
+export GOOGLE_API_KEY=your_key
 streamlit run app.py
 ```
-
-## Update the knowledge base
-Replace `eatsafe_master_database.csv` (same columns) — no code changes needed.
