@@ -1,6 +1,0 @@
-streamlit>=1.36
-pillow
-numpy
-pandas
-plotly
-surya-ocr>=0.16,<0.17
