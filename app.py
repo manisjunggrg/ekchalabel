@@ -8,6 +8,7 @@ from utils import (
     LabelAnalysis,
     OCRResult,
     TextZones,
+    _COMBINED_ENGINE,
     analyze_label,
     available_engines,
     classify_health,
@@ -82,16 +83,22 @@ with st.sidebar:
 
     engines = available_engines()
     engine_labels = {
-        "auto": "Auto (best available)",
-        "ocrspace": "OCR.space (cloud) — best on Streamlit Cloud",
-        "paddleocr": "PaddleOCR — heavy, local only",
-        "easyocr": "EasyOCR — heavy, local only",
-        "tesseract": "Tesseract — light fallback",
+        "auto":               "🔄 Auto (best available)",
+        _COMBINED_ENGINE:     "⚡ OCR.space + Tesseract (combined — recommended)",
+        "ocrspace":           "☁️ OCR.space only (cloud, best on photos)",
+        "tesseract":          "🖨️ Tesseract only (local, best on clean prints)",
+        "paddleocr":          "🐼 PaddleOCR — heavy, local only",
+        "easyocr":            "👁️ EasyOCR — heavy, local only",
     }
-    options = ["auto"] + [e for e in ["ocrspace", "paddleocr", "easyocr", "tesseract"]
-                          if e in engines]
-    engine = st.selectbox("OCR engine", options,
+    _engine_order = ["auto", _COMBINED_ENGINE, "ocrspace", "tesseract", "paddleocr", "easyocr"]
+    options = [e for e in _engine_order if e in engines or e == "auto"]
+    default_idx = options.index(_COMBINED_ENGINE) if _COMBINED_ENGINE in options else 0
+    engine = st.selectbox("OCR engine", options, index=default_idx,
                           format_func=lambda x: engine_labels.get(x, x))
+    if engine == _COMBINED_ENGINE:
+        st.caption("Runs OCR.space (3 passes) and Tesseract in parallel, then merges "
+                   "results. Best overall coverage — cloud fills gaps that local "
+                   "Tesseract misses, and vice versa.")
 
     if not ocrspace_key_configured():
         st.info("Using the OCR.space **demo** key (rate-limited). Add a free "
@@ -190,7 +197,10 @@ with left:
     st.image(image, caption="Input image", use_container_width=True)
 
 with right:
-    with st.spinner(f"🔍 Running OCR ({engine}) — dual-engine with overlay …"):
+    _spinner_label = {
+        _COMBINED_ENGINE: "⚡ Running OCR.space + Tesseract in parallel …",
+    }.get(engine, f"🔍 Running OCR ({engine}) — dual-engine with overlay …")
+    with st.spinner(_spinner_label):
         ocr_result: OCRResult = extract_text_with_overlay(
             image, languages=lang_choice, engine=engine, preprocess=preprocess,
         )
