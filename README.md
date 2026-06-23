@@ -6,28 +6,45 @@ plain-language verdict.
 
 ## Files
 - `app.py` — Streamlit UI
-- `utils.py` — OCR, ingredient matching, scoring, verdict
-- `eatsafe_master_database.csv` — ingredient knowledge base
+- `utils.py` — OCR (dual-engine + overlay), ingredient matching, scoring, verdict
+- `eatsafe_master_database.csv` — ingredient knowledge base (8,752 items)
 - `requirements.txt` / `packages.txt` — dependencies
 
-## OCR engines
-Tesseract is built for clean scans and is unreliable on photographed labels.
-This app uses a multi-engine pipeline (`engine="auto"` picks the best one
-available):
+## OCR pipeline
 
-| Engine      | Accuracy on photos | Memory | Good for |
-|-------------|--------------------|--------|----------|
-| **OCR.space** (cloud) | High | Tiny (runs server-side) | **Streamlit Cloud** |
-| PaddleOCR   | Highest | Heavy | Local / Docker only |
-| EasyOCR     | High | Heavy (torch) | Local / Docker only |
-| Tesseract   | Low | Light | Fallback / clean scans |
+### The problem with Tesseract
+Tesseract is built for clean scans. It is unreliable on photographed labels
+(curved text, shadows, uneven lighting). That is why earlier versions
+struggled to extract text.
 
-## Deploying on Streamlit Community Cloud (recommended path)
-The free tier (~1 GB RAM) cannot reliably run PaddleOCR/EasyOCR — they bloat
-the build or run out of memory. Use the **OCR.space cloud engine** instead:
+### Solution: OCR.space dual-engine with bounding boxes
+The app calls the **OCR.space** cloud API (free tier, no credit card) which
+runs deep-learning OCR on their server — accurate on real photos and uses
+almost no app memory:
+
+| Engine | Strength |
+|--------|----------|
+| **OCR.space Engine 2** | Best on photographed / curved text |
+| **OCR.space Engine 1** | Best on structured tables (nutrition facts) |
+
+Both engines run; their results are **merged and deduplicated**. The API also
+returns **word-level bounding boxes**, which the app draws on the image:
+
+- 🟩 **Green** boxes — nutrition-related lines (Energy, Fat, Sugar …)
+- 🟦 **Blue** boxes — other text (ingredients, brand name, etc.)
+
+The **🔍 OCR Debug** tab shows the annotated image beside a line-by-line
+readout so you can immediately see what was read, what was missed, and which
+lines are nutrition vs ingredients.
+
+If OCR.space is unavailable the app falls back to Tesseract (installed via
+`packages.txt`). PaddleOCR / EasyOCR can be enabled for local runs but are
+too heavy for Streamlit Cloud's 1 GB free tier.
+
+## Deploying on Streamlit Community Cloud
 
 1. Get a free API key (no credit card) at https://ocr.space/ocrapi
-2. In your app on Streamlit Cloud: **Settings → Secrets**, add:
+2. In your app on Streamlit Cloud → **Settings → Secrets**, add:
    ```toml
    OCR_SPACE_API_KEY = "your_key_here"
    ```
@@ -38,22 +55,13 @@ engine). Do **not** add `libgl1` / `libglib2.0-0` — `opencv-python-headless`
 needs no system GL libs, and pinning glib breaks the apt solver on Streamlit
 Cloud's Debian image.
 
-Without a key the app uses OCR.space's public demo key, which works but is
-heavily rate-limited — fine for a quick test, not for a demo day.
-
-> Note: OCR.space's photo engine targets Latin scripts (English). Most FMCG
-> labels in Nepal include English text, so this is usually sufficient. For
-> Devanagari (Nepali/Hindi), run locally with EasyOCR, or use Google Cloud
-> Vision (premium cloud OCR, needs a GCP key).
+Without a key the app uses OCR.space's public demo key — works but is
+heavily rate-limited (fine for a quick test, not for a demo day).
 
 ## Run locally
 ```bash
 pip install -r requirements.txt
-# To use the heavier local engines, also:
-#   pip install easyocr            (or)   pip install paddleocr paddlepaddle
-# For the Tesseract fallback on Ubuntu:
-#   sudo apt install tesseract-ocr
-export OCR_SPACE_API_KEY=your_key   # optional but recommended
+export OCR_SPACE_API_KEY=your_key   # recommended
 streamlit run app.py
 ```
 
