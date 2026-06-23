@@ -3,4 +3,4 @@ pillow
 numpy
 pandas
 plotly
-google-generativeai
+surya-ocr>=0.16,<0.17
