@@ -8,8 +8,8 @@ requests            # OCR.space cloud OCR (recommended on Streamlit Cloud)
 pytesseract         # local fallback OCR (uses tesseract from packages.txt)
 opencv-python-headless
 
-# Optional NLP cleaning (app falls back to regex if missing)
-spacy
+# Optional NLP cleaning (app falls back to regex if missing — safe to skip)
+# spacy              # ~200 MB with model; may OOM on free tier
 
 # ── DO NOT enable these on Streamlit Community Cloud free tier ──
 # They are large and commonly fail to build or run out of memory there.
