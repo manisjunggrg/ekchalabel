@@ -1,0 +1,48 @@
+ingredient,aliases,category,classification,risk_level,description
+sodium benzoate,e211,Preservative,harmful,High,Common preservative; may form benzene with vitamin C and is linked to hyperactivity in children.
+trans fat,partially hydrogenated|hydrogenated oil|hydrogenated vegetable oil,Fat,harmful,High,Raises LDL cholesterol and lowers HDL; a major cardiovascular risk and banned in many countries.
+sodium nitrite,e250,Preservative,harmful,High,Used in cured meats; associated with formation of nitrosamines and colorectal cancer risk.
+sodium nitrate,e251,Preservative,harmful,High,Curing agent that converts to nitrite; linked to increased cancer risk with high intake.
+high fructose corn syrup,hfcs|glucose-fructose syrup|glucose fructose syrup,Sweetener,harmful,High,"Cheap sweetener strongly linked to obesity, fatty liver and metabolic syndrome."
+potassium bromate,e924,Flour Treatment,harmful,High,"Dough strengthener banned in the EU, UK and many countries as a possible carcinogen."
+azodicarbonamide,ada|e927a,Flour Treatment,harmful,High,Dough conditioner banned in the EU/Australia; degradation products are of safety concern.
+brominated vegetable oil,bvo,Stabiliser,harmful,High,Emulsifier in some sodas; bromine can accumulate in tissue. Banned in several countries.
+aspartame,e951,Sweetener,caution,Moderate,Artificial sweetener; may trigger headaches in sensitive people and unsafe for those with PKU.
+monosodium glutamate,msg|e621,Flavour Enhancer,caution,Moderate,"Flavour enhancer that can cause transient reactions (headache, flushing) in sensitive individuals."
+tartrazine,yellow 5|fd&c yellow 5|e102,Colouring,caution,Moderate,Synthetic yellow dye linked to allergic reactions and hyperactivity in some children.
+sunset yellow,yellow 6|fd&c yellow 6|e110,Colouring,caution,Moderate,Synthetic dye associated with hyperactivity and allergic responses in sensitive children.
+allura red,red 40|fd&c red 40|e129,Colouring,caution,Moderate,Synthetic red dye linked to hyperactivity in children; restricted in some regions.
+bha,butylated hydroxyanisole|e320,Antioxidant,caution,Moderate,Preservative classified as a possible human carcinogen (IARC Group 2B).
+bht,butylated hydroxytoluene|e321,Antioxidant,caution,Moderate,Preservative with possible endocrine-disrupting effects in animal studies.
+carrageenan,e407,Thickener,caution,Moderate,Seaweed-derived thickener that may promote gut inflammation in some people.
+sulphur dioxide,sulfur dioxide|e220,Preservative,caution,Moderate,Preservative that can trigger asthma and breathing problems in sensitive individuals.
+sodium metabisulphite,sodium metabisulfite|e223,Preservative,caution,Moderate,Sulphite preservative; a known trigger for asthma and allergic reactions.
+propyl gallate,e310,Antioxidant,caution,Moderate,Antioxidant with some animal evidence of endocrine and reproductive effects.
+palm oil,palm kernel oil,Fat,caution,Moderate,High in saturated fat; frequent intake can raise cholesterol. Also an environmental concern.
+saccharin,e954,Sweetener,caution,Low,Older artificial sweetener once linked to cancer; now generally regarded as safe in normal amounts.
+acesulfame,acesulfame potassium|ace-k|e950,Sweetener,caution,Low,Artificial sweetener considered safe by regulators but with limited long-term data.
+caramel colour,caramel color|e150,Colouring,caution,Low,"Widely used colouring; some forms (E150d) contain trace 4-MEI, a compound under study."
+maltodextrin,,Filler,caution,Low,Highly processed carbohydrate with a high glycaemic index; spikes blood sugar quickly.
+artificial colour,artificial color|added colour|added color,Colouring,caution,Moderate,Generic synthetic colouring; several specific dyes are linked to hyperactivity in children.
+artificial flavour,artificial flavor|added flavour|added flavor,Flavouring,caution,Low,Generic synthetic flavouring; usually safe but masks the absence of real ingredients.
+water,aqua,Base,safe,Safe,Essential base ingredient with no health concern.
+wheat flour,refined flour|maida|atta,Grain,safe,Safe,Common grain base; choose wholegrain where possible.
+milk,milk solids|skimmed milk|whole milk,Dairy,safe,Safe,Natural dairy source of protein and calcium.
+whey protein,whey|whey powder,Protein,safe,Safe,High-quality dairy protein commonly used in foods and supplements.
+oats,rolled oats|oat flour,Grain,safe,Safe,Wholegrain rich in soluble fibre that supports heart health.
+vitamin c,ascorbic acid|e300,Vitamin,safe,Safe,Essential vitamin and natural antioxidant; beneficial.
+vitamin e,tocopherol|tocopherols|e306,Vitamin,safe,Safe,Fat-soluble vitamin used as a natural antioxidant; beneficial.
+citric acid,e330,Acidity Regulator,safe,Safe,Naturally occurring acid used safely as a flavour and preservative.
+lecithin,soy lecithin|sunflower lecithin|e322,Emulsifier,safe,Safe,Natural emulsifier from soy or sunflower; well tolerated.
+pectin,e440,Thickener,safe,Safe,Natural fruit-derived gelling agent; also a source of fibre.
+baking soda,sodium bicarbonate|e500,Raising Agent,safe,Safe,Common leavening agent considered safe in food amounts.
+cocoa,cocoa solids|cocoa powder|cacao,Flavour,safe,Safe,Natural cocoa rich in flavonoid antioxidants.
+honey,,Sweetener,safe,Safe,"Natural sweetener; still high in sugar, so use in moderation."
+olive oil,extra virgin olive oil,Fat,safe,Safe,Heart-healthy unsaturated fat rich in antioxidants.
+yeast,baker's yeast,Leavening,safe,Safe,Natural leavening agent used in baking; safe.
+gelatin,gelatine,Gelling Agent,safe,Safe,Protein-based gelling agent; safe but not vegetarian.
+guar gum,e412,Thickener,safe,Safe,Plant-based fibre thickener; safe and adds soluble fibre.
+xanthan gum,e415,Thickener,safe,Safe,Fermentation-derived thickener regarded as safe.
+calcium carbonate,e170,Mineral,safe,Safe,Mineral used for fortification and as an anti-caking agent; safe.
+salt,sodium chloride|iodised salt,Mineral,caution,Low,Essential but easy to over-consume; high intake raises blood pressure.
+sugar,sucrose|cane sugar|table sugar,Sweetener,caution,Low,Natural sweetener; excess intake is linked to weight gain and tooth decay.

@@ -1,0 +1,5 @@
+tesseract-ocr
+tesseract-ocr-eng
+tesseract-ocr-nep
+tesseract-ocr-hin
+libgl1
