@@ -1,26 +1,22 @@
 """
 utils.py – e-K Cha Label?
 
-Single-engine approach: Google Gemini Flash Vision reads the label image
-and returns structured JSON (product name, ingredients, nutrition table).
-No traditional OCR, no regex parsing, no zone splitting needed.
+OCR engine: Surya OCR (v0.16.x) — deep-learning, 90+ languages, line-level
+bounding boxes. Far more accurate than Tesseract on photographed labels.
 
-Ingredient intelligence comes from `eatsafe_master_database.csv` (8.7k items).
+Pipeline: Surya OCR → zone split → nutrition parsing → dataset match → score.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import json
-import base64
 import functools
-from io import BytesIO
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Dataset
@@ -60,162 +56,295 @@ def load_ingredient_db(path: str = DATASET_PATH) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Gemini Vision – structured label extraction
+# 2. Surya OCR
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EXTRACTION_PROMPT = """You are a food label reader. Analyse this product label image and
-extract ALL information you can see. Return ONLY valid JSON (no markdown
-fences, no explanation) with exactly this structure:
-
-{
-  "product_name": "string or empty",
-  "ingredients": ["ingredient1", "ingredient2", ...],
-  "nutrition_facts": [
-    {"nutrient": "Calories", "value": 320, "unit": "kcal"},
-    {"nutrient": "Total Fat", "value": 14.0, "unit": "g"},
-    ...
-  ],
-  "raw_text": "all text visible on the label as a single string"
-}
-
-Rules:
-- For ingredients: list every individual ingredient you can read, split
-  by commas. Keep names simple (e.g. "wheat flour" not "WHEAT FLOUR (66%)").
-- For nutrition_facts: extract EVERY row from the nutrition table.
-  Include the nutrient name exactly as printed, its numeric value, and
-  the unit (g, mg, kcal, %, IU, mcg etc). If a value is 0, still include it.
-- For raw_text: transcribe everything you can read on the label.
-- If a section is not visible, use an empty list.
-- Return ONLY the JSON object. No other text."""
+# Cached model objects — loaded once via st.cache_resource in app.py.
+_MODELS: dict = {}
 
 
-def _get_gemini_key() -> Optional[str]:
-    key = os.environ.get("GOOGLE_API_KEY")
-    if key:
-        return key
-    try:
-        import streamlit as st
-        return st.secrets.get("GOOGLE_API_KEY")
-    except Exception:
-        return None
+def load_surya_models():
+    """Load Surya detection + recognition models. Call once and cache."""
+    if _MODELS:
+        return _MODELS
+    # Minimise memory: force CPU, small batch.
+    os.environ.setdefault("TORCH_DEVICE", "cpu")
+    os.environ.setdefault("RECOGNITION_BATCH_SIZE", "4")
+    os.environ.setdefault("DETECTOR_BATCH_SIZE", "2")
+
+    from surya.model.detection.model import load_model as load_det_model
+    from surya.model.detection.model import load_processor as load_det_processor
+    from surya.model.recognition.model import load_model as load_rec_model
+    from surya.model.recognition.processor import load_processor as load_rec_processor
+
+    _MODELS["det_model"] = load_det_model()
+    _MODELS["det_processor"] = load_det_processor()
+    _MODELS["rec_model"] = load_rec_model()
+    _MODELS["rec_processor"] = load_rec_processor()
+    return _MODELS
 
 
-def gemini_key_configured() -> bool:
-    return bool(_get_gemini_key())
+class OCRLine:
+    """A single text line with bounding box."""
+    __slots__ = ("text", "bbox", "confidence")
+
+    def __init__(self, text: str, bbox: tuple | None = None, confidence: float = 0.0):
+        self.text = text
+        self.bbox = bbox        # (x1, y1, x2, y2) corners
+        self.confidence = confidence
 
 
-def _image_to_base64(image: Image.Image, max_side: int = 2000) -> str:
-    """Resize if needed, encode to base64 JPEG."""
+class OCRResult:
+    __slots__ = ("lines", "annotated_image")
+
+    def __init__(self):
+        self.lines: list[OCRLine] = []
+        self.annotated_image: Optional[Image.Image] = None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(ln.text for ln in self.lines if ln.text.strip())
+
+
+def _preprocess(image: Image.Image) -> Image.Image:
+    """Light enhancement — Surya handles most preprocessing internally."""
+    from PIL import ImageEnhance
     img = image.copy()
     w, h = img.size
-    if max(w, h) > max_side:
-        scale = max_side / max(w, h)
+    if max(w, h) < 1500:
+        scale = 1500 / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Sharpness(img).enhance(1.5)
+    return img
 
 
-def extract_label_data(image: Image.Image) -> dict:
-    """
-    Send the label image to Gemini Flash and get structured extraction.
+def run_surya_ocr(image: Image.Image, langs: list[str] | None = None,
+                  preprocess: bool = True) -> OCRResult:
+    """Run Surya OCR and return lines with bounding boxes."""
+    from surya.ocr import run_ocr
 
-    Returns dict with keys:
-        product_name, ingredients, nutrition_facts, raw_text
-    """
-    import time
-    import google.generativeai as genai
-    from google.api_core.exceptions import ResourceExhausted
+    models = load_surya_models()
+    work = _preprocess(image) if preprocess else image
+    if langs is None:
+        langs = ["en"]
 
-    key = _get_gemini_key()
-    if not key:
-        raise RuntimeError(
-            "GOOGLE_API_KEY not set. Add it in Settings → Secrets on Streamlit Cloud, "
-            "or set the GOOGLE_API_KEY environment variable. "
-            "Get a free key at https://aistudio.google.com/apikey"
-        )
+    predictions = run_ocr(
+        [work], [langs],
+        models["det_model"], models["det_processor"],
+        models["rec_model"], models["rec_processor"],
+    )
 
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    result = OCRResult()
+    if predictions:
+        for text_line in predictions[0].text_lines:
+            bbox_raw = text_line.bbox          # [x1,y1,x2,y2]
+            bbox = tuple(bbox_raw) if bbox_raw else None
+            conf = getattr(text_line, "confidence", 0.0)
+            result.lines.append(OCRLine(text_line.text, bbox, conf))
+    # Sort top to bottom.
+    result.lines.sort(key=lambda ln: (ln.bbox[1] if ln.bbox else 0))
+    return result
 
-    # Retry up to 3 times with backoff on rate limits.
-    last_err: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            response = model.generate_content(
-                [_EXTRACTION_PROMPT, image],
-                generation_config=genai.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=4096,
-                ),
-            )
-            break  # success
-        except ResourceExhausted as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(5 * (attempt + 1))  # 5s, 10s
-                continue
-            raise RuntimeError(
-                "⏳ **Gemini rate limit reached** (free tier: 15 requests/min).  \n"
-                "Wait ~60 seconds and try again, or upgrade to a paid key for higher limits."
-            ) from e
 
-    raw = response.text.strip()
-    # Strip markdown fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+# ── Nutrition-line detection (for overlay colours) ───────────────────────────
 
+_NUTRITION_KEYWORDS = {
+    "energy", "calories", "kcal", "cal", "fat", "saturated", "trans",
+    "carbohydrate", "sugar", "sugars", "fibre", "fiber", "protein",
+    "sodium", "salt", "cholesterol", "serving", "nutrition", "daily",
+    "value", "vitamin", "iron", "calcium", "potassium", "amount",
+}
+
+
+def _is_nutrition_line(text: str) -> bool:
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    return bool(words & _NUTRITION_KEYWORDS) and bool(re.search(r"\d", text))
+
+
+# ── Draw overlay ─────────────────────────────────────────────────────────────
+
+def draw_ocr_overlay(image: Image.Image, ocr_result: OCRResult) -> Image.Image:
+    annotated = image.copy().convert("RGBA")
+    overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Try to extract JSON object from the response
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if match:
-            data = json.loads(match.group())
-        else:
-            raise RuntimeError(f"Gemini returned invalid JSON:\n{raw[:500]}")
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                  max(10, int(image.height * 0.013)))
+    except Exception:
+        font = ImageFont.load_default()
 
-    # Normalise
-    data.setdefault("product_name", "")
-    data.setdefault("ingredients", [])
-    data.setdefault("nutrition_facts", [])
-    data.setdefault("raw_text", "")
+    # Scale factor: if we preprocessed up, bboxes are in the scaled space.
+    w_orig, h_orig = image.size
+    if ocr_result.lines and ocr_result.lines[0].bbox:
+        max_x = max((ln.bbox[2] for ln in ocr_result.lines if ln.bbox), default=w_orig)
+        scale_x = w_orig / max_x if max_x > w_orig * 1.1 else 1.0
+        max_y = max((ln.bbox[3] for ln in ocr_result.lines if ln.bbox), default=h_orig)
+        scale_y = h_orig / max_y if max_y > h_orig * 1.1 else 1.0
+    else:
+        scale_x = scale_y = 1.0
 
-    # Ensure ingredients is a flat list of strings
-    data["ingredients"] = [
-        str(i).strip() for i in data["ingredients"]
-        if str(i).strip()
-    ]
+    for ln in ocr_result.lines:
+        if not ln.bbox or not ln.text.strip():
+            continue
+        x1, y1, x2, y2 = [c * s for c, s in zip(ln.bbox, [scale_x, scale_y, scale_x, scale_y])]
+        is_nut = _is_nutrition_line(ln.text)
+        fill = (34, 197, 94, 40) if is_nut else (59, 130, 246, 40)
+        outline = (34, 197, 94) if is_nut else (59, 130, 246)
+        draw.rectangle([x1, y1, x2, y2], fill=fill, outline=outline, width=2)
 
-    # Ensure nutrition_facts entries have the right shape
-    cleaned_nf = []
-    for item in data["nutrition_facts"]:
-        if isinstance(item, dict) and "nutrient" in item:
+    annotated = Image.alpha_composite(annotated, overlay).convert("RGB")
+    return annotated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Zone splitting
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INGREDIENT_HEADERS = re.compile(
+    r"(?:ingredients|composition|made\s+(?:from|with))\s*[:\-]?", re.IGNORECASE)
+_NUTRITION_HEADERS = re.compile(
+    r"(?:nutrition\s*(?:facts|information|value|per)|amount\s+per|daily\s+value|"
+    r"per\s+(?:serving|\d+\s*[gm]l?))", re.IGNORECASE)
+_NUTRITION_ROW = re.compile(
+    r"(?:energy|calories?|kcal|total\s*fat|trans\s*fat|saturated|cholesterol|"
+    r"sodium|salt|carbohydrate|sugar|fibre|fiber|protein|vitamin|calcium|"
+    r"iron|potassium|daily\s*value|serving|amount)[^\n]{0,30}\d", re.IGNORECASE)
+
+
+class TextZones:
+    __slots__ = ("nutrition", "ingredients", "other", "full")
+
+    def __init__(self, nutrition: str, ingredients: str, other: str, full: str):
+        self.nutrition = nutrition
+        self.ingredients = ingredients
+        self.other = other
+        self.full = full
+
+    @property
+    def for_ingredient_matching(self) -> str:
+        parts = []
+        if self.ingredients.strip():
+            parts.append(self.ingredients)
+        if self.other.strip():
+            parts.append(self.other)
+        return "\n".join(parts) if parts else self.full
+
+    @property
+    def for_nutrition_parsing(self) -> str:
+        return self.nutrition if self.nutrition.strip() else self.full
+
+
+def split_text_zones(text: str) -> TextZones:
+    lines = text.split("\n")
+    nut, ing, other = [], [], []
+    zone = "other"
+    for line in lines:
+        s = line.strip()
+        if not s:
+            if zone == "ingredients":
+                zone = "other"
+            continue
+        if _INGREDIENT_HEADERS.search(s):
+            zone = "ingredients"
+            after = re.split(r"[:;\-]\s*", s, maxsplit=1)
+            if len(after) > 1 and after[1].strip():
+                ing.append(after[1].strip())
+            continue
+        if _NUTRITION_HEADERS.search(s):
+            zone = "nutrition"
+            continue
+        if zone == "ingredients":
+            ing.append(s)
+            continue
+        if _NUTRITION_ROW.search(s):
+            nut.append(s)
+            zone = "nutrition"
+            continue
+        if zone == "nutrition":
+            zone = "other"
+        other.append(s)
+    return TextZones("\n".join(nut), "\n".join(ing), "\n".join(other), text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Nutrition parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NUTRIENT_PATTERNS = {
+    "calories":  [r"(?:energy|calories?)[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(kcal|cal|kj)?"],
+    "sugar":     [r"sugars?\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "fat":       [r"(?:total\s*fat|fat)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "sodium":    [r"(?:sodium|salt)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)"],
+    "protein":   [r"protein\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "carbs":     [r"(?:carbohydrates?|carbs?)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "fibre":     [r"(?:dietary\s*fibre|fibre|fiber)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "saturated": [r"(?:saturated\s*fat|saturates)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "trans_fat": [r"trans\s*fat\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    "cholesterol": [r"cholesterol\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+}
+
+
+def parse_nutritional_values(raw_text: str) -> dict[str, float]:
+    text_lower = raw_text.lower()
+    result = {k: 0.0 for k in _NUTRIENT_PATTERNS}
+    for nutrient, patterns in _NUTRIENT_PATTERNS.items():
+        for pattern in patterns:
+            m = re.search(pattern, text_lower)
+            if not m:
+                continue
             try:
-                val = float(item.get("value", 0))
-            except (ValueError, TypeError):
-                val = 0.0
-            cleaned_nf.append({
-                "nutrient": str(item["nutrient"]).strip(),
-                "value": val,
-                "unit": str(item.get("unit", "")).strip(),
-            })
-    data["nutrition_facts"] = cleaned_nf
-    return data
+                value = float(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            unit = m.group(2) if m.lastindex and m.lastindex >= 2 else ""
+            if unit == "mg" and nutrient != "calories":
+                value /= 1000.0
+            result[nutrient] = value
+            break
+    return result
+
+
+def nutrition_for_display(nutrition: dict[str, float]) -> list[dict]:
+    """Convert flat scoring dict to displayable list with units."""
+    display = []
+    for key, value in nutrition.items():
+        if value > 0:
+            unit = "kcal" if key == "calories" else "g"
+            label = key.replace("_", " ").title()
+            display.append({"nutrient": label, "value": value, "unit": unit})
+    return display
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Ingredient matching (dataset-driven)
+# 5. Ingredient matching
 # ─────────────────────────────────────────────────────────────────────────────
+
+_SHORT_ALLOW = {"msg", "bha", "bht", "egg", "soy", "oat", "nut", "b12", "b9", "d3"}
+
+_NUTRIENT_NOISE = {
+    "sugar", "sugars", "sodium", "cholesterol", "fat", "trans fat",
+    "saturated fat", "total fat", "calories", "protein", "carbohydrate",
+    "carbohydrates", "fibre", "fiber", "energy",
+    "powder", "soup", "flavors", "flavor", "colour", "color",
+    "extract", "concentrate", "blend",
+}
+
+
+def _matchable(term: str) -> bool:
+    t = term.strip().lower()
+    return len(t) >= 4 or t in _SHORT_ALLOW
+
 
 @functools.lru_cache(maxsize=1)
-def _build_lookup() -> dict[str, dict]:
-    """Build a lowercase name → metadata lookup from the dataset."""
+def _build_index():
     db = load_ingredient_db()
-    lookup: dict[str, dict] = {}
+    matchers = []
+    meta = {}
     for row in db.itertuples(index=False):
-        lookup[row.ingredient] = {
-            "ingredient": row.ingredient,
+        name = row.ingredient
+        meta[name] = {
+            "ingredient": name,
             "classification": row.classification,
             "risk_level": row.risk_level,
             "category": nova_label(row.nova_group),
@@ -227,51 +356,33 @@ def _build_lookup() -> dict[str, dict]:
             "whole_food_bonus": float(row.whole_food_bonus),
             "description": row.reason,
         }
-    return lookup
+        if _matchable(name) and name not in _NUTRIENT_NOISE:
+            matchers.append((name, re.compile(r"\b" + re.escape(name) + r"\b")))
+    matchers.sort(key=lambda x: len(x[0]), reverse=True)
+    return matchers, meta
 
 
-def match_ingredients(ingredient_list: list[str]) -> list[dict]:
-    """
-    Match a list of ingredient names (from Gemini) against the dataset.
-
-    Uses exact match first, then substring search for multi-word names.
-    Returns metadata dicts for every match, sorted harmful → caution → safe.
-    """
-    lookup = _build_lookup()
-    db = load_ingredient_db()
-    all_names = set(db["ingredient"].tolist())
-    matched: dict[str, dict] = {}
-
-    for raw_name in ingredient_list:
-        name = raw_name.strip().lower()
-        if not name or len(name) < 3:
+def detect_ingredients(text: str) -> list[dict]:
+    matchers, meta = _build_index()
+    haystack = " " + text.lower() + " "
+    found = {}
+    claimed = []
+    for name, pattern in matchers:
+        if name in found:
             continue
-
-        # 1. Exact match
-        if name in lookup and name not in matched:
-            matched[name] = lookup[name]
-            continue
-
-        # 2. Substring match: find the longest dataset name inside this ingredient
-        best: Optional[str] = None
-        best_len = 0
-        for db_name in all_names:
-            if len(db_name) < 4:
-                continue  # skip very short to avoid noise
-            if db_name in name and len(db_name) > best_len:
-                best = db_name
-                best_len = len(db_name)
-        if best and best not in matched:
-            matched[best] = lookup[best]
-
+        for mt in pattern.finditer(haystack):
+            s, e = mt.span()
+            if any(cs <= s and e <= ce for cs, ce in claimed):
+                continue
+            found[name] = meta[name]
+            claimed.append((s, e))
+            break
     order = {"harmful": 0, "caution": 1, "safe": 2}
-    return sorted(
-        matched.values(),
-        key=lambda d: (order.get(d["classification"], 3), d["gemini_rating"]),
-    )
+    return sorted(found.values(),
+                  key=lambda d: (order.get(d["classification"], 3), d["gemini_rating"]))
 
 
-def count_concerns(detected: list[dict]) -> tuple[int, int, int]:
+def count_concerns(detected):
     h = sum(1 for d in detected if d["classification"] == "harmful")
     c = sum(1 for d in detected if d["classification"] == "caution")
     s = sum(1 for d in detected if d["classification"] == "safe")
@@ -279,93 +390,35 @@ def count_concerns(detected: list[dict]) -> tuple[int, int, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Nutrition helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Map common nutrient label names to canonical keys for scoring.
-_NUTRIENT_ALIASES: dict[str, str] = {}
-for _key, _aliases in {
-    "calories": ["calories", "energy", "kcal", "cal"],
-    "sugar": ["sugar", "sugars", "total sugars", "of which sugars", "total sugar"],
-    "fat": ["total fat", "fat", "total fats"],
-    "sodium": ["sodium", "salt", "na"],
-    "protein": ["protein", "proteins"],
-    "carbs": ["carbohydrate", "carbohydrates", "total carbohydrate", "total carbohydrates", "carbs"],
-    "fibre": ["dietary fibre", "dietary fiber", "fibre", "fiber", "total dietary fiber"],
-    "saturated": ["saturated fat", "saturated fats", "saturates", "of which saturates"],
-    "trans_fat": ["trans fat", "trans fats", "trans"],
-    "cholesterol": ["cholesterol"],
-}.items():
-    for a in _aliases:
-        _NUTRIENT_ALIASES[a.lower()] = _key
-
-
-def nutrition_to_scoring_dict(nutrition_facts: list[dict]) -> dict[str, float]:
-    """
-    Convert the Gemini nutrition_facts list into a flat dict with
-    canonical keys and values normalised to grams (mg → g).
-    """
-    result: dict[str, float] = {}
-    for item in nutrition_facts:
-        name = item["nutrient"].lower().strip()
-        canonical = _NUTRIENT_ALIASES.get(name)
-        if not canonical:
-            # Try partial match
-            for alias, key in _NUTRIENT_ALIASES.items():
-                if alias in name:
-                    canonical = key
-                    break
-        if not canonical:
-            continue
-        if canonical in result:
-            continue  # keep first match (usually the main value)
-
-        value = item["value"]
-        unit = item["unit"].lower().strip()
-        if unit == "mg":
-            value /= 1000.0
-        elif unit in ("mcg", "µg"):
-            value /= 1_000_000.0
-        result[canonical] = value
-
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Scoring
+# 6. Scoring
 # ─────────────────────────────────────────────────────────────────────────────
 
 _THRESHOLDS = {
-    "sugar":    {"low": 5,   "high": 22.5},
-    "fat":      {"low": 3,   "high": 17.5},
-    "sodium":   {"low": 0.3, "high": 1.5},
-    "calories": {"low": 40,  "high": 400},
+    "sugar": {"low": 5, "high": 22.5},
+    "fat": {"low": 3, "high": 17.5},
+    "sodium": {"low": 0.3, "high": 1.5},
+    "calories": {"low": 40, "high": 400},
 }
 
 
-def _penalty(value: float, low: float, high: float) -> float:
-    if value <= low:
-        return 0.0
-    if value >= high:
-        return 1.0
+def _penalty(value, low, high):
+    if value <= low: return 0.0
+    if value >= high: return 1.0
     return (value - low) / (high - low)
 
 
-def _nutrition_score(nutrition: dict[str, float]) -> Optional[float]:
+def _nutrition_score(nutrition):
     if not any(nutrition.get(k, 0) > 0 for k in ("sugar", "fat", "sodium", "calories")):
         return None
-    pen = (
-        0.35 * _penalty(nutrition.get("sugar", 0), *_THRESHOLDS["sugar"].values())
-        + 0.30 * _penalty(nutrition.get("fat", 0), *_THRESHOLDS["fat"].values())
-        + 0.20 * _penalty(nutrition.get("calories", 0), *_THRESHOLDS["calories"].values())
-        + 0.15 * _penalty(nutrition.get("sodium", 0), *_THRESHOLDS["sodium"].values())
-    )
+    pen = (0.35 * _penalty(nutrition.get("sugar", 0), 5, 22.5)
+           + 0.30 * _penalty(nutrition.get("fat", 0), 3, 17.5)
+           + 0.20 * _penalty(nutrition.get("calories", 0), 40, 400)
+           + 0.15 * _penalty(nutrition.get("sodium", 0), 0.3, 1.5))
     return (1 - pen) * 100
 
 
-def _ingredient_score(detected: list[dict]) -> Optional[float]:
-    if not detected:
-        return None
+def _ingredient_score(detected):
+    if not detected: return None
     ratings = [d["gemini_rating"] for d in detected]
     proc = np.mean([d["processing_penalty"] for d in detected])
     bonus = np.mean([d["whole_food_bonus"] for d in detected])
@@ -373,7 +426,7 @@ def _ingredient_score(detected: list[dict]) -> Optional[float]:
     return float(np.clip(base - proc * 12 + bonus * 8, 0, 100))
 
 
-def compute_score(detected: list[dict], nutrition: dict[str, float]) -> int:
+def compute_score(detected, nutrition):
     ing = _ingredient_score(detected)
     nut = _nutrition_score(nutrition)
     if ing is not None and nut is not None:
@@ -389,7 +442,7 @@ def compute_score(detected: list[dict], nutrition: dict[str, float]) -> int:
     return int(round(max(0, min(100, base))))
 
 
-def get_grade(score: int) -> str:
+def get_grade(score):
     if score >= 80: return "A"
     if score >= 65: return "B"
     if score >= 50: return "C"
@@ -397,24 +450,21 @@ def get_grade(score: int) -> str:
     return "E"
 
 
-def classify_health(score: int) -> str:
+def classify_health(score):
     if score >= 70: return "✅ Healthy"
     if score >= 40: return "⚠️ Moderate"
     return "🚨 Unhealthy"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Explanation
+# 7. Explanation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_explanation(
-    score: int, risk: str, detected: list[dict], nutrition: dict[str, float],
-) -> str:
+def generate_explanation(score, risk, detected, nutrition):
     avoid = [d for d in detected if d["classification"] == "harmful"]
     limit = [d for d in detected if d["classification"] == "caution"]
     worst = sorted(avoid + limit, key=lambda d: d["gemini_rating"])[:5]
-
-    lines: list[str] = []
+    lines = []
     if score >= 70:
         lines.append(f"### ✅ Relatively healthy (score {score}/100)")
         lines.append("Ingredients are mostly whole / minimally processed.")
@@ -426,28 +476,15 @@ def generate_explanation(
         lines.append("Heavily processed ingredients and/or poor nutrition.")
     lines.append("---")
 
-    if detected:
-        avg = np.mean([d["gemini_rating"] for d in detected])
-        lines.append(f"**Ingredient quality:** {avg:.1f}/5 average across "
-                     f"{len(detected)} matched ingredients.")
-
     sugar = nutrition.get("sugar", 0)
-    if sugar > 22.5:
-        lines.append(f"🔴 **High sugar** ({sugar:.1f} g)")
-    elif sugar > 5:
-        lines.append(f"🟡 **Moderate sugar** ({sugar:.1f} g)")
-
+    if sugar > 22.5: lines.append(f"🔴 **High sugar** ({sugar:.1f} g)")
+    elif sugar > 5: lines.append(f"🟡 **Moderate sugar** ({sugar:.1f} g)")
     fat = nutrition.get("fat", 0)
-    if fat > 17.5:
-        lines.append(f"🔴 **High fat** ({fat:.1f} g)")
-    elif fat > 3:
-        lines.append(f"🟡 **Moderate fat** ({fat:.1f} g)")
-
+    if fat > 17.5: lines.append(f"🔴 **High fat** ({fat:.1f} g)")
+    elif fat > 3: lines.append(f"🟡 **Moderate fat** ({fat:.1f} g)")
     sodium = nutrition.get("sodium", 0)
-    if sodium > 1.5:
-        lines.append(f"🔴 **High sodium** ({sodium:.2f} g)")
-    elif sodium > 0.3:
-        lines.append(f"🟡 **Moderate sodium** ({sodium:.2f} g)")
+    if sodium > 1.5: lines.append(f"🔴 **High sodium** ({sodium:.2f} g)")
+    elif sodium > 0.3: lines.append(f"🟡 **Moderate sodium** ({sodium:.2f} g)")
 
     if avoid:
         lines.append(f"⛔ **{len(avoid)} 'avoid' additive(s):** "
@@ -461,60 +498,50 @@ def generate_explanation(
 
     lines.append("---")
     lines.append("**💡 Recommendation:**")
-    if score >= 70:
-        lines.append("A reasonable choice — maintain variety.")
-    elif score >= 40:
-        lines.append("Limit to a few servings per week; pair with whole foods.")
-    else:
-        lines.append("Prefer less-processed alternatives.")
+    if score >= 70: lines.append("A reasonable choice — maintain variety.")
+    elif score >= 40: lines.append("Limit to a few servings per week; pair with whole foods.")
+    else: lines.append("Prefer less-processed alternatives.")
     lines.append("> *Educational analysis. Consult a nutritionist for personal advice.*")
     return "\n\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Full pipeline
+# 8. Full pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LabelAnalysis:
     __slots__ = (
-        "product_name", "raw_text",
-        "extracted_ingredients", "nutrition_facts",
-        "detected", "harmful", "nutrition",
-        "score", "grade", "risk",
+        "ocr_result", "zones", "detected", "harmful", "nutrition",
+        "nutrition_display", "score", "grade", "risk",
         "h_cnt", "c_cnt", "s_cnt",
     )
 
     def __init__(self):
-        self.product_name: str = ""
-        self.raw_text: str = ""
-        self.extracted_ingredients: list[str] = []
-        self.nutrition_facts: list[dict] = []
+        self.ocr_result: Optional[OCRResult] = None
+        self.zones: Optional[TextZones] = None
         self.detected: list[dict] = []
         self.harmful: list[str] = []
         self.nutrition: dict[str, float] = {}
+        self.nutrition_display: list[dict] = []
         self.score: int = 50
         self.grade: str = "C"
         self.risk: str = "⚠️ Moderate"
         self.h_cnt = self.c_cnt = self.s_cnt = 0
 
 
-def analyze_label(image: Image.Image) -> LabelAnalysis:
-    """Full pipeline: Gemini extraction → dataset match → score."""
-    data = extract_label_data(image)
-
+def analyze_label(image: Image.Image, langs=None, preprocess=True) -> LabelAnalysis:
     a = LabelAnalysis()
-    a.product_name = data.get("product_name", "")
-    a.raw_text = data.get("raw_text", "")
-    a.extracted_ingredients = data.get("ingredients", [])
-    a.nutrition_facts = data.get("nutrition_facts", [])
-
-    a.nutrition = nutrition_to_scoring_dict(a.nutrition_facts)
-    a.detected = match_ingredients(a.extracted_ingredients)
+    a.ocr_result = run_surya_ocr(image, langs, preprocess)
+    raw_text = a.ocr_result.text
+    a.zones = split_text_zones(raw_text)
+    a.nutrition = parse_nutritional_values(a.zones.for_nutrition_parsing)
+    a.nutrition_display = nutrition_for_display(a.nutrition)
+    a.detected = detect_ingredients(a.zones.for_ingredient_matching)
     a.harmful = [d["ingredient"] for d in a.detected
                  if d["classification"] in ("harmful", "caution")]
     a.h_cnt, a.c_cnt, a.s_cnt = count_concerns(a.detected)
-
     a.score = compute_score(a.detected, a.nutrition)
     a.grade = get_grade(a.score)
     a.risk = classify_health(a.score)
+    a.ocr_result.annotated_image = draw_ocr_overlay(image, a.ocr_result)
     return a
