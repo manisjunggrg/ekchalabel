@@ -123,7 +123,9 @@ def extract_label_data(image: Image.Image) -> dict:
     Returns dict with keys:
         product_name, ingredients, nutrition_facts, raw_text
     """
+    import time
     import google.generativeai as genai
+    from google.api_core.exceptions import ResourceExhausted
 
     key = _get_gemini_key()
     if not key:
@@ -136,13 +138,27 @@ def extract_label_data(image: Image.Image) -> dict:
     genai.configure(api_key=key)
     model = genai.GenerativeModel("gemini-2.0-flash")
 
-    response = model.generate_content(
-        [_EXTRACTION_PROMPT, image],
-        generation_config=genai.GenerationConfig(
-            temperature=0.1,
-            max_output_tokens=4096,
-        ),
-    )
+    # Retry up to 3 times with backoff on rate limits.
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            response = model.generate_content(
+                [_EXTRACTION_PROMPT, image],
+                generation_config=genai.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=4096,
+                ),
+            )
+            break  # success
+        except ResourceExhausted as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))  # 5s, 10s
+                continue
+            raise RuntimeError(
+                "⏳ **Gemini rate limit reached** (free tier: 15 requests/min).  \n"
+                "Wait ~60 seconds and try again, or upgrade to a paid key for higher limits."
+            ) from e
 
     raw = response.text.strip()
     # Strip markdown fences if present
