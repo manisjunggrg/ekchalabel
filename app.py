@@ -5,7 +5,10 @@ import streamlit as st
 from PIL import Image
 
 from utils import (
+    LabelAnalysis,
     OCRResult,
+    TextZones,
+    analyze_label,
     available_engines,
     classify_health,
     clean_text,
@@ -21,6 +24,7 @@ from utils import (
     nova_label,
     ocrspace_key_configured,
     parse_nutritional_values,
+    split_text_zones,
     _is_nutrition_line,
 )
 
@@ -196,16 +200,17 @@ with right:
         st.warning("⚠️ No text extracted. Try a sharper image, or switch OCR engine in the sidebar.")
         st.stop()
 
-    with st.spinner("🧠 Matching ingredients & nutrition …"):
-        cleaned = clean_text(raw_text)
-        detected = detect_ingredients(raw_text)
-        harmful = detect_harmful_ingredients(raw_text)
-        nutrition = parse_nutritional_values(raw_text)
-        h_cnt, c_cnt, s_cnt = count_concerns(detected)
+    with st.spinner("🧠 Zone splitting + ingredient matching + nutrition …"):
+        analysis: LabelAnalysis = analyze_label(raw_text)
+        detected = analysis.detected
+        harmful = analysis.harmful
+        nutrition = analysis.nutrition
+        h_cnt, c_cnt, s_cnt = analysis.h_cnt, analysis.c_cnt, analysis.s_cnt
+        zones = analysis.zones
 
-    score = compute_score(detected, nutrition)
-    grade = get_grade(score)
-    risk = classify_health(score)
+    score = analysis.score
+    grade = analysis.grade
+    risk = analysis.risk
     avg_rating = float(np.mean([d["gemini_rating"] for d in detected])) if detected else 0.0
     colour = GOOD if score >= 70 else WARN if score >= 40 else BAD
 
@@ -300,6 +305,39 @@ with tab_ocr:
     sc2.metric("Nutrition lines", nut_count)
     sc3.metric("Other lines", total_lines - nut_count)
     sc4.metric("Characters", len(raw_text))
+
+    # ── Zone splitting debug ─────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📐 Text zone splitting")
+    st.caption(
+        "The OCR text is split into zones **before** analysis. "
+        "Nutrition values are parsed from the **Nutrition zone** only. "
+        "Ingredients are matched from the **Ingredient zone** only — "
+        "this prevents words like 'sugar', 'sodium', 'trans fat' in the "
+        "nutrition table from being falsely flagged as harmful ingredients."
+    )
+    z1, z2, z3 = st.columns(3)
+    with z1:
+        st.markdown("**🟩 Nutrition zone**")
+        nut_text = zones.nutrition if zones.nutrition.strip() else "(empty — will use full text)"
+        st.text_area("Nutrition", nut_text, height=180, disabled=True, label_visibility="collapsed")
+    with z2:
+        st.markdown("**🟦 Ingredient zone**")
+        ing_text = zones.ingredients if zones.ingredients.strip() else "(empty — will use 'other' zone)"
+        st.text_area("Ingredients", ing_text, height=180, disabled=True, label_visibility="collapsed")
+    with z3:
+        st.markdown("**⬜ Other text**")
+        oth_text = zones.other if zones.other.strip() else "(empty)"
+        st.text_area("Other", oth_text, height=180, disabled=True, label_visibility="collapsed")
+
+    st.caption(
+        f"**Ingredient matching ran against:** "
+        f"{'ingredient zone' if zones.ingredients.strip() else 'other zone (no Ingredients: header found)'} "
+        f"({len(zones.for_ingredient_matching)} chars)  \n"
+        f"**Nutrition parsing ran against:** "
+        f"{'nutrition zone' if zones.nutrition.strip() else 'full text (no nutrition section found)'} "
+        f"({len(zones.for_nutrition_parsing)} chars)"
+    )
 
 with tab1:
     st.subheader("Ingredients to avoid or limit")
