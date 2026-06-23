@@ -6,26 +6,15 @@ from PIL import Image
 
 from utils import (
     LabelAnalysis,
-    OCRResult,
-    TextZones,
     analyze_label,
-    available_engines,
     classify_health,
-    clean_text,
     compute_score,
     count_concerns,
-    detect_harmful_ingredients,
-    detect_ingredients,
-    draw_ocr_overlay,
-    extract_text_with_overlay,
+    gemini_key_configured,
     generate_explanation,
     get_grade,
     load_ingredient_db,
     nova_label,
-    ocrspace_key_configured,
-    parse_nutritional_values,
-    split_text_zones,
-    _is_nutrition_line,
 )
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -57,8 +46,12 @@ st.markdown(
         border-radius:12px; padding:.8rem 1.05rem; margin-bottom:.65rem;
         box-shadow:0 2px 8px rgba(20,20,50,.04); }}
     .badge {{ color:#fff; border-radius:999px; padding:2px 10px; font-size:.7rem; font-weight:600; }}
-    .tok {{ display:inline-block; border-radius:8px; padding:3px 10px; font-size:.8rem;
-        margin:3px; font-weight:500; }}
+    .nut-row {{ display:flex; justify-content:space-between; align-items:center;
+        padding:6px 12px; border-bottom:1px solid #f0f0f5; font-size:.92rem; }}
+    .nut-row:nth-child(odd) {{ background:#f8f9fb; }}
+    .nut-label {{ font-weight:600; color:{INK}; }}
+    .nut-val {{ font-weight:700; color:{PRIMARY}; font-size:1.0rem; }}
+    .nut-unit {{ color:#8d99ae; font-size:.82rem; margin-left:4px; }}
     </style>
     """, unsafe_allow_html=True,
 )
@@ -67,11 +60,11 @@ st.markdown(
     """
     <div class="hero">
       <h1>🔬 e-K Cha Label?</h1>
-      <p>AI-based FMCG label analyzer — deep-learning OCR · ~8.7k-ingredient EatSafe database · NOVA processing intelligence</p>
+      <p>AI-based FMCG label analyzer — Gemini Vision · 8.7k-ingredient EatSafe database</p>
       <span class="chip">📷 Scan any label</span>
       <span class="chip">🧪 Ingredient safety</span>
-      <span class="chip">🏭 NOVA processing level</span>
-      <span class="chip">📊 Health score 0–100</span>
+      <span class="chip">📊 Nutrition extraction</span>
+      <span class="chip">💬 Health verdict</span>
     </div>
     """, unsafe_allow_html=True,
 )
@@ -79,27 +72,15 @@ st.markdown(
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    engines = available_engines()
-    engine_labels = {
-        "auto": "Auto (best available)",
-        "ocrspace": "OCR.space (cloud) — best on Streamlit Cloud",
-        "paddleocr": "PaddleOCR — heavy, local only",
-        "easyocr": "EasyOCR — heavy, local only",
-        "tesseract": "Tesseract — light fallback",
-    }
-    options = ["auto"] + [e for e in ["ocrspace", "paddleocr", "easyocr", "tesseract"]
-                          if e in engines]
-    engine = st.selectbox("OCR engine", options,
-                          format_func=lambda x: engine_labels.get(x, x))
-
-    if not ocrspace_key_configured():
-        st.info("Using the OCR.space **demo** key (rate-limited). Add a free "
-                "`OCR_SPACE_API_KEY` in your app's **Secrets** for reliable use.")
-
-    lang_choice = st.multiselect("Language(s) on label", ["en", "ne", "hi"], default=["en"])
-    preprocess = st.toggle("Enhance image before OCR", value=True)
-    show_raw = st.toggle("Show raw OCR text", value=False)
+    if gemini_key_configured():
+        st.success("✅ Gemini API key configured")
+    else:
+        st.error(
+            "🔑 **GOOGLE_API_KEY** not set.  \n"
+            "Add it in **Settings → Secrets**:  \n"
+            '```\nGOOGLE_API_KEY = "your_key"\n```  \n'
+            "Get a free key → [Google AI Studio](https://aistudio.google.com/apikey)"
+        )
 
     st.markdown("---")
     st.header("📚 EatSafe database")
@@ -107,7 +88,7 @@ with st.sidebar:
         _db = load_ingredient_db()
         vc = _db["additive_risk"].value_counts()
         st.caption(
-            f"**{len(_db):,}** ingredients loaded  \n"
+            f"**{len(_db):,}** ingredients  \n"
             f"🔴 {int(vc.get('avoid',0)):,} avoid · 🟠 {int(vc.get('limit',0)):,} limit · "
             f"🟢 {int(vc.get('safe',0)):,} safe"
         )
@@ -119,7 +100,7 @@ with st.sidebar:
     except Exception as e:
         st.error(f"Could not load database: {e}")
     st.markdown("---")
-    st.caption("Swap `eatsafe_master_database.csv` to update the knowledge base — no code changes.")
+    st.caption("Engine: **Gemini 2.0 Flash** (vision)")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -145,7 +126,7 @@ def gauge_figure(score, colour):
 def ingredient_card(d):
     label, colour = CLASS_BADGE.get(d["classification"], ("?", "#8d99ae"))
     art = ('&nbsp;<span class="badge" style="background:#6d597a">Artificial</span>'
-           if d["artificial_flag"] else "")
+           if d.get("artificial_flag") else "")
     return f"""
     <div class="ing-card" style="border-left-color:{colour}">
       <b style="font-size:1.0rem">{d['ingredient'].title()}</b>
@@ -156,6 +137,26 @@ def ingredient_card(d):
     </div>"""
 
 
+def render_nutrition_table(nf: list[dict]):
+    """Render nutrition facts as a styled label → value + unit table."""
+    html = '<div style="border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;margin:8px 0">'
+    html += (f'<div style="background:{PRIMARY};color:#fff;padding:10px 14px;'
+             f'font-weight:700;font-size:1.0rem">Nutrition Facts (extracted by Gemini)</div>')
+    for item in nf:
+        nutrient = item["nutrient"]
+        value = item["value"]
+        unit = item["unit"]
+        # Format value: int if whole, else 1 decimal
+        val_str = f"{value:g}" if value == int(value) else f"{value:.1f}"
+        html += (f'<div class="nut-row">'
+                 f'<span class="nut-label">{nutrient}</span>'
+                 f'<span><span class="nut-val">{val_str}</span>'
+                 f'<span class="nut-unit">{unit}</span></span>'
+                 f'</div>')
+    html += '</div>'
+    return html
+
+
 # ── Input ─────────────────────────────────────────────────────────────────────
 st.subheader("📥 Provide a label image")
 tab_upload, tab_camera = st.tabs(["📂 Upload image", "📷 Use camera"])
@@ -163,7 +164,7 @@ image = None
 with tab_upload:
     up = st.file_uploader("Upload an FMCG product label",
                           type=["jpg", "jpeg", "png", "webp"],
-                          help="Clear, well-lit, straight-on photos read best.")
+                          help="Clear, well-lit photos read best.")
     if up:
         image = Image.open(up).convert("RGB")
 with tab_camera:
@@ -174,11 +175,11 @@ with tab_camera:
 if image is None:
     st.info("👆 Upload an image or capture one with your camera to begin.")
     with st.expander("ℹ️ How it works", expanded=True):
-        steps = [("📷", "Image input", "Upload or capture a label."),
-                 ("🔍", "Deep OCR", "PaddleOCR/EasyOCR extract text from the photo."),
-                 ("🧪", "Match", "Tokens are matched to the ~8.7k EatSafe database."),
-                 ("📊", "Score", "Rating + NOVA + nutrition → 0–100 score."),
-                 ("💬", "Verdict", "Plain-language summary of the risks.")]
+        steps = [("📷", "Image", "Upload or capture a label."),
+                 ("🤖", "Gemini Vision", "AI reads the label, extracts text, nutrition table & ingredients."),
+                 ("🧪", "Database match", "Ingredients matched against 8.7k EatSafe entries."),
+                 ("📊", "Score", "0–100 health score from ingredients + nutrition."),
+                 ("💬", "Verdict", "Plain-language health summary.")]
         cols = st.columns(len(steps))
         for col, (i, t, d) in zip(cols, steps):
             col.markdown(f"### {i}\n**{t}**\n\n<small>{d}</small>", unsafe_allow_html=True)
@@ -190,29 +191,23 @@ with left:
     st.image(image, caption="Input image", use_container_width=True)
 
 with right:
-    with st.spinner(f"🔍 Running OCR ({engine}) — dual-engine with overlay …"):
-        ocr_result: OCRResult = extract_text_with_overlay(
-            image, languages=lang_choice, engine=engine, preprocess=preprocess,
-        )
-        raw_text = ocr_result.text
-
-    if not raw_text.strip():
-        st.warning("⚠️ No text extracted. Try a sharper image, or switch OCR engine in the sidebar.")
+    try:
+        with st.spinner("🤖 Gemini is reading the label …"):
+            analysis: LabelAnalysis = analyze_label(image)
+    except RuntimeError as e:
+        st.error(str(e))
         st.stop()
-
-    with st.spinner("🧠 Zone splitting + ingredient matching + nutrition …"):
-        analysis: LabelAnalysis = analyze_label(raw_text)
-        detected = analysis.detected
-        harmful = analysis.harmful
-        nutrition = analysis.nutrition
-        h_cnt, c_cnt, s_cnt = analysis.h_cnt, analysis.c_cnt, analysis.s_cnt
-        zones = analysis.zones
 
     score = analysis.score
     grade = analysis.grade
     risk = analysis.risk
-    avg_rating = float(np.mean([d["gemini_rating"] for d in detected])) if detected else 0.0
+    detected = analysis.detected
+    nutrition = analysis.nutrition
     colour = GOOD if score >= 70 else WARN if score >= 40 else BAD
+    avg_rating = float(np.mean([d["gemini_rating"] for d in detected])) if detected else 0.0
+
+    if analysis.product_name:
+        st.markdown(f"**Product:** {analysis.product_name}")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.markdown(metric_card("Health score", f"{score}", colour), unsafe_allow_html=True)
@@ -224,175 +219,114 @@ with right:
                     config={"displayModeBar": False})
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("🔴 Avoid", h_cnt)
-    c2.metric("🟠 Limit", c_cnt)
-    c3.metric("🟢 Safe", s_cnt)
-
-if show_raw:
-    with st.expander("📄 Raw OCR text"):
-        st.text(raw_text)
+    c1.metric("🔴 Avoid", analysis.h_cnt)
+    c2.metric("🟠 Limit", analysis.c_cnt)
+    c3.metric("🟢 Safe", analysis.s_cnt)
 
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ocr, tab1, tab2, tab3, tab4 = st.tabs(
-    ["🔍 OCR Debug", "⚠️ Flagged", "🧪 All ingredients", "📈 Nutrition", "💬 Verdict"])
+tab_nut, tab_flag, tab_all, tab_verdict, tab_raw = st.tabs(
+    ["📈 Nutrition", "⚠️ Flagged", "🧪 All ingredients", "💬 Verdict", "📄 Raw extraction"])
 
-# Tab 0 — OCR Debug: annotated image + line-by-line text
-with tab_ocr:
-    st.subheader("OCR text detection — what the engine reads")
-    st.caption(
-        "🟩 **Green boxes** = nutrition-related lines · "
-        "🟦 **Blue boxes** = other text (ingredients, brand, etc.)"
-    )
+# Tab: Nutrition — THE KEY TABLE
+with tab_nut:
+    st.subheader("Nutrition Facts — extracted from label")
+    if analysis.nutrition_facts:
+        ncol1, ncol2 = st.columns([1.1, 1.3], gap="large")
+        with ncol1:
+            st.markdown(render_nutrition_table(analysis.nutrition_facts), unsafe_allow_html=True)
 
-    ocr_left, ocr_right = st.columns([1.2, 1], gap="large")
-    with ocr_left:
-        if ocr_result.annotated_image is not None:
-            st.image(ocr_result.annotated_image, caption="Annotated — detected text regions",
-                     use_container_width=True)
-        else:
-            st.info("Bounding-box overlay is only available with the OCR.space engine.")
-            st.image(image, caption="Original image (no overlay)", use_container_width=True)
+        with ncol2:
+            # Bar chart of key nutrients
+            plot_items = [nf for nf in analysis.nutrition_facts if nf["value"] > 0]
+            if plot_items:
+                names = [f"{nf['nutrient']} ({nf['unit']})" for nf in plot_items]
+                vals = [nf["value"] for nf in plot_items]
+                # Colour by concern level
+                concern_keys = {"sugar", "sugars", "total fat", "fat", "sodium", "salt",
+                                "saturated fat", "trans fat", "cholesterol"}
+                bar_colours = [
+                    BAD if nf["nutrient"].lower() in concern_keys else PRIMARY
+                    for nf in plot_items
+                ]
+                fig = go.Figure(go.Bar(
+                    x=vals, y=names, orientation="h",
+                    marker_color=bar_colours,
+                    text=[f"{v:g}" for v in vals], textposition="outside",
+                ))
+                fig.update_layout(
+                    height=max(280, len(plot_items) * 32),
+                    margin=dict(l=10, r=30, t=10, b=10),
+                    xaxis_title="Amount",
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    yaxis=dict(autorange="reversed"),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    with ocr_right:
-        st.markdown("##### Extracted lines")
-        if ocr_result.lines:
-            nut_lines = []
-            other_lines = []
-            for ln in ocr_result.lines:
-                if not ln.text.strip():
-                    continue
-                if _is_nutrition_line(ln.text):
-                    nut_lines.append(ln)
-                else:
-                    other_lines.append(ln)
+        # Scoring breakdown
+        if nutrition:
+            st.markdown("##### Values used for scoring (normalised)")
+            score_df = pd.DataFrame([
+                {"Nutrient": k.title(), "Value": f"{v:g}", "Unit": "kcal" if k == "calories" else "g"}
+                for k, v in nutrition.items() if v > 0
+            ])
+            if not score_df.empty:
+                st.dataframe(score_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No nutrition table found on this label.")
 
-            if nut_lines:
-                st.markdown(f"**🟩 Nutrition facts ({len(nut_lines)} lines)**")
-                for ln in nut_lines:
-                    conf_str = f" · conf {ln.confidence:.0f}%" if ln.confidence else ""
-                    eng_str = f" [{ln.engine}]" if ln.engine else ""
-                    st.markdown(
-                        f'<div style="background:#ecfdf5;border-left:4px solid #22c55e;'
-                        f'padding:4px 10px;margin:3px 0;border-radius:6px;font-size:.88rem">'
-                        f'{ln.text} <span style="color:#6b7280;font-size:.72rem">'
-                        f'{conf_str}{eng_str}</span></div>',
-                        unsafe_allow_html=True,
-                    )
-
-            if other_lines:
-                st.markdown(f"**🟦 Other text ({len(other_lines)} lines)**")
-                for ln in other_lines:
-                    conf_str = f" · conf {ln.confidence:.0f}%" if ln.confidence else ""
-                    eng_str = f" [{ln.engine}]" if ln.engine else ""
-                    st.markdown(
-                        f'<div style="background:#eff6ff;border-left:4px solid #3b82f6;'
-                        f'padding:4px 10px;margin:3px 0;border-radius:6px;font-size:.88rem">'
-                        f'{ln.text} <span style="color:#6b7280;font-size:.72rem">'
-                        f'{conf_str}{eng_str}</span></div>',
-                        unsafe_allow_html=True,
-                    )
-        else:
-            st.warning("No lines with bounding data available.")
-
-    # Summary stats
-    total_lines = len([ln for ln in ocr_result.lines if ln.text.strip()])
-    nut_count = sum(1 for ln in ocr_result.lines if ln.text.strip() and _is_nutrition_line(ln.text))
-    st.markdown("---")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("Total lines", total_lines)
-    sc2.metric("Nutrition lines", nut_count)
-    sc3.metric("Other lines", total_lines - nut_count)
-    sc4.metric("Characters", len(raw_text))
-
-    # ── Zone splitting debug ─────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📐 Text zone splitting")
-    st.caption(
-        "The OCR text is split into zones **before** analysis. "
-        "Nutrition values are parsed from the **Nutrition zone** only. "
-        "Ingredients are matched from the **Ingredient zone** only — "
-        "this prevents words like 'sugar', 'sodium', 'trans fat' in the "
-        "nutrition table from being falsely flagged as harmful ingredients."
-    )
-    z1, z2, z3 = st.columns(3)
-    with z1:
-        st.markdown("**🟩 Nutrition zone**")
-        nut_text = zones.nutrition if zones.nutrition.strip() else "(empty — will use full text)"
-        st.text_area("Nutrition", nut_text, height=180, disabled=True, label_visibility="collapsed")
-    with z2:
-        st.markdown("**🟦 Ingredient zone**")
-        ing_text = zones.ingredients if zones.ingredients.strip() else "(empty — will use 'other' zone)"
-        st.text_area("Ingredients", ing_text, height=180, disabled=True, label_visibility="collapsed")
-    with z3:
-        st.markdown("**⬜ Other text**")
-        oth_text = zones.other if zones.other.strip() else "(empty)"
-        st.text_area("Other", oth_text, height=180, disabled=True, label_visibility="collapsed")
-
-    st.caption(
-        f"**Ingredient matching ran against:** "
-        f"{'ingredient zone' if zones.ingredients.strip() else 'other zone (no Ingredients: header found)'} "
-        f"({len(zones.for_ingredient_matching)} chars)  \n"
-        f"**Nutrition parsing ran against:** "
-        f"{'nutrition zone' if zones.nutrition.strip() else 'full text (no nutrition section found)'} "
-        f"({len(zones.for_nutrition_parsing)} chars)"
-    )
-
-with tab1:
+# Tab: Flagged
+with tab_flag:
     st.subheader("Ingredients to avoid or limit")
     flagged = [d for d in detected if d["classification"] in ("harmful", "caution")]
     if flagged:
-        for d in flagged[:40]:
+        for d in flagged:
             st.markdown(ingredient_card(d), unsafe_allow_html=True)
     else:
         st.success("✅ No 'avoid' or 'limit' ingredients detected.")
 
-with tab2:
-    st.subheader(f"All recognised ingredients ({len(detected)})")
-    safe = [d for d in detected if d["classification"] == "safe"]
-    flagged = [d for d in detected if d["classification"] != "safe"]
-    if flagged:
-        st.markdown("##### Flagged")
-        for d in flagged[:40]:
-            st.markdown(ingredient_card(d), unsafe_allow_html=True)
-    if safe:
-        st.markdown("##### Safe ingredients")
-        chips = "".join(
-            f'<span class="tok" style="background:#e8f5f2;color:#1d6e63">'
-            f'{d["ingredient"].title()} · ★{d["gemini_rating"]:.1f}</span>' for d in safe)
-        st.markdown(chips, unsafe_allow_html=True)
-    if not detected:
-        st.info("No database ingredients recognised in the extracted text.")
+# Tab: All ingredients
+with tab_all:
+    st.subheader(f"Gemini extracted {len(analysis.extracted_ingredients)} ingredients")
 
-with tab3:
-    st.subheader("Parsed nutritional values (per 100 g/ml)")
-    present = {k: v for k, v in nutrition.items() if v > 0}
-    if present:
-        df_nut = pd.DataFrame(
-            [(k.title(), v, "kcal" if k == "calories" else "g") for k, v in nutrition.items()],
-            columns=["Nutrient", "Value", "Unit"])
-        cc1, cc2 = st.columns([1, 1.4], gap="large")
-        with cc1:
-            st.dataframe(df_nut, use_container_width=True, hide_index=True)
-        with cc2:
-            keys = list(present.keys())
-            vals = [present[k] for k in keys]
-            bar_colours = [BAD if k in ("sugar", "fat", "sodium", "saturated") else PRIMARY
-                           for k in keys]
-            fig = go.Figure(go.Bar(x=vals, y=[k.title() for k in keys], orientation="h",
-                                   marker_color=bar_colours, text=[f"{v:g}" for v in vals],
-                                   textposition="outside"))
-            fig.update_layout(height=300, margin=dict(l=10, r=20, t=10, b=10),
-                              xaxis_title="Amount (g / kcal)",
-                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.info("No nutritional values could be parsed from this label.")
+    # Show what Gemini read vs what matched the database
+    ext_col, match_col = st.columns(2, gap="large")
+    with ext_col:
+        st.markdown("**📝 Extracted from label**")
+        for ing in analysis.extracted_ingredients:
+            matched_names = {d["ingredient"] for d in detected}
+            is_matched = ing.strip().lower() in matched_names or any(
+                ing.strip().lower() in d["ingredient"] or d["ingredient"] in ing.strip().lower()
+                for d in detected
+            )
+            icon = "🟢" if is_matched else "⚪"
+            st.markdown(f"{icon} {ing}")
+        if not analysis.extracted_ingredients:
+            st.info("No ingredients extracted.")
 
-with tab4:
+    with match_col:
+        st.markdown(f"**🗄️ Matched in database ({len(detected)})**")
+        safe = [d for d in detected if d["classification"] == "safe"]
+        flagged_all = [d for d in detected if d["classification"] != "safe"]
+        if flagged_all:
+            for d in flagged_all:
+                st.markdown(ingredient_card(d), unsafe_allow_html=True)
+        if safe:
+            st.markdown("**Safe:**")
+            chips = "".join(
+                f'<span style="display:inline-block;background:#e8f5f2;color:#1d6e63;'
+                f'border-radius:8px;padding:3px 10px;font-size:.82rem;margin:3px;font-weight:500">'
+                f'{d["ingredient"].title()} · ★{d["gemini_rating"]:.1f}</span>' for d in safe)
+            st.markdown(chips, unsafe_allow_html=True)
+        if not detected:
+            st.info("No database matches found.")
+
+# Tab: Verdict
+with tab_verdict:
     st.subheader("AI-generated health verdict")
     st.markdown(generate_explanation(score, risk, detected, nutrition))
+
     if detected:
         st.markdown("##### Ingredient ratings (lower = worse)")
         worst = sorted(detected, key=lambda d: d["gemini_rating"])[:12]
@@ -401,13 +335,22 @@ with tab4:
             x=[d["gemini_rating"] for d in worst][::-1],
             y=[d["ingredient"].title() for d in worst][::-1],
             orientation="h",
-            marker_color=[cl[d["classification"]] for d in worst][::-1],
+            marker_color=[cl.get(d["classification"], PRIMARY) for d in worst][::-1],
             text=[f'{d["gemini_rating"]:.1f}' for d in worst][::-1], textposition="outside"))
-        fig.update_layout(height=360, margin=dict(l=10, r=20, t=10, b=10),
+        fig.update_layout(height=max(280, len(worst) * 32),
+                          margin=dict(l=10, r=20, t=10, b=10),
                           xaxis_title="Rating (0–5)", xaxis_range=[0, 5.4],
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
+# Tab: Raw extraction
+with tab_raw:
+    st.subheader("Raw Gemini extraction")
+    st.caption("Everything Gemini read from the label, shown for debugging.")
+    if analysis.raw_text:
+        st.text_area("Full text", analysis.raw_text, height=250, disabled=True)
+    else:
+        st.info("No raw text returned.")
+
 st.markdown("---")
-st.caption("⚠️ **Disclaimer:** Educational tool only. Classifications come from a curated "
-           "dataset and may be incomplete. Consult a qualified nutritionist for dietary advice.")
+st.caption("⚠️ **Disclaimer:** Educational tool only. Consult a qualified nutritionist for dietary advice.")
