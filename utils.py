@@ -204,6 +204,74 @@ def _ocr_tesseract(image: Image.Image, languages: list[str], preprocess: bool) -
         return pytesseract.image_to_string(work, lang="eng", config="--oem 3 --psm 6")
 
 
+def _ocr_tesseract_lines(image: Image.Image, languages: list[str], preprocess: bool) -> list[OCRLine]:
+    """
+    Run Tesseract and return OCRLine objects with bounding boxes.
+    Uses pytesseract.image_to_data() which gives per-word bbox + confidence.
+    Words are grouped back into lines using Tesseract's own line/block numbers.
+    """
+    import pytesseract
+
+    tess = "+".join(_TESS_LANG.get(l, "eng") for l in languages) or "eng"
+    work = _binarise_for_tesseract(image) if preprocess else image
+
+    try:
+        df = pytesseract.image_to_data(
+            work, lang=tess,
+            config="--oem 3 --psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        # Fallback: plain string wrapped as lines without bboxes.
+        try:
+            plain = pytesseract.image_to_string(work, lang=tess, config="--oem 3 --psm 6")
+        except Exception:
+            plain = pytesseract.image_to_string(work, lang="eng", config="--oem 3 --psm 6")
+        return [OCRLine(l.strip(), engine="tesseract")
+                for l in plain.splitlines() if l.strip()]
+
+    # Group words into lines keyed by (block_num, par_num, line_num).
+    from collections import defaultdict
+    line_words: dict[tuple, list[dict]] = defaultdict(list)
+    n = len(df["text"])
+    for i in range(n):
+        word = df["text"][i].strip()
+        conf = int(df["conf"][i]) if df["conf"][i] != "-1" else 0
+        if not word or conf < 0:
+            continue
+        key = (df["block_num"][i], df["par_num"][i], df["line_num"][i])
+        line_words[key].append({
+            "text": word,
+            "conf": conf,
+            "left": df["left"][i],
+            "top": df["top"][i],
+            "width": df["width"][i],
+            "height": df["height"][i],
+        })
+
+    # Build OCRLine per group, scaling bbox back to original image coords.
+    # Tesseract runs on the preprocessed (potentially upscaled) image;
+    # we need to map back to original dimensions.
+    orig_w, orig_h = image.size
+    proc_w, proc_h = work.size if hasattr(work, "size") else (orig_w, orig_h)
+    sx = orig_w / proc_w if proc_w else 1.0
+    sy = orig_h / proc_h if proc_h else 1.0
+
+    lines_out: list[OCRLine] = []
+    for key in sorted(line_words):
+        words = line_words[key]
+        text = " ".join(w["text"] for w in words)
+        avg_conf = sum(w["conf"] for w in words) / len(words)
+        left = min(w["left"] for w in words)
+        top = min(w["top"] for w in words)
+        right = max(w["left"] + w["width"] for w in words)
+        bottom = max(w["top"] + w["height"] for w in words)
+        bbox = (left * sx, top * sy, (right - left) * sx, (bottom - top) * sy)
+        lines_out.append(OCRLine(text, bbox=bbox, confidence=avg_conf, engine="tesseract"))
+
+    return lines_out
+
+
 def _ocrspace_key() -> Optional[str]:
     """Read the OCR.space API key from env var or Streamlit secrets."""
     key = os.environ.get("OCR_SPACE_API_KEY")
@@ -591,13 +659,63 @@ _ENGINES = {
 }
 _AUTO_ORDER = ["ocrspace", "paddleocr", "easyocr", "tesseract"]
 
+# Combined mode: run OCR.space + Tesseract in parallel and merge.
+_COMBINED_ENGINE = "ocrspace+tesseract"
+
+
+def _run_combined_ocr(
+    image: Image.Image, languages: list[str], preprocess: bool,
+) -> OCRResult:
+    """
+    Run OCR.space (cloud, 3 passes) and Tesseract (local) concurrently,
+    then merge all lines with the same fuzzy-dedup logic used elsewhere.
+
+    OCR.space is strong on photographed/curved text.
+    Tesseract (binarised) is strong on clean printed text and table rows
+    with high contrast.  Together they cover each other's blind spots.
+    """
+    import concurrent.futures
+
+    ocrspace_result: OCRResult = OCRResult()
+    tess_lines: list[OCRLine] = []
+
+    def run_ocrspace():
+        return _ocr_ocrspace_with_overlay(image, languages, preprocess)
+
+    def run_tesseract():
+        return _ocr_tesseract_lines(image, languages, preprocess)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_cloud = pool.submit(run_ocrspace)
+        f_tess = pool.submit(run_tesseract)
+
+        try:
+            ocrspace_result = f_cloud.result(timeout=90)
+        except Exception:
+            pass
+        try:
+            tess_lines = f_tess.result(timeout=30)
+        except Exception:
+            pass
+
+    # Merge: OCR.space as base (has bboxes), Tesseract fills gaps.
+    merged = _merge_lines(ocrspace_result.lines, tess_lines)
+
+    combined = OCRResult()
+    combined.lines = merged
+    combined._scale = ocrspace_result._scale
+    return combined
+
 
 def available_engines() -> list[str]:
     """Return OCR engines that can actually run in this environment."""
     found = []
+    has_ocrspace = False
+    has_tesseract = False
     try:
         import requests  # noqa: F401
         found.append("ocrspace")
+        has_ocrspace = True
     except Exception:
         pass
     for name, mod in [("paddleocr", "paddleocr"), ("easyocr", "easyocr"),
@@ -605,8 +723,13 @@ def available_engines() -> list[str]:
         try:
             __import__(mod)
             found.append(name)
+            if name == "tesseract":
+                has_tesseract = True
         except Exception:
             pass
+    # Combined mode is available when both engines are present.
+    if has_ocrspace and has_tesseract:
+        found.insert(1, _COMBINED_ENGINE)  # second option, right after ocrspace
     return found
 
 
@@ -623,10 +746,24 @@ def extract_text_with_overlay(
 ) -> OCRResult:
     """
     Full OCR pipeline returning text + bounding boxes + annotated image.
-    Falls through engines just like extract_text().
+
+    engine options:
+      "auto"               — try OCR.space → PaddleOCR → EasyOCR → Tesseract
+      "ocrspace+tesseract" — run BOTH concurrently and merge (recommended)
+      "ocrspace"           — OCR.space only (3 passes, best on photos)
+      "tesseract"          — Tesseract only (fast, best on clean prints)
+      "paddleocr"          — PaddleOCR (local only, heavy)
+      "easyocr"            — EasyOCR (local only, heavy)
     """
     if languages is None:
         languages = ["en"]
+
+    # ── Combined mode: OCR.space + Tesseract in parallel ─────────────────
+    if engine == _COMBINED_ENGINE:
+        result = _run_combined_ocr(image, languages, preprocess)
+        if result.lines:
+            result.annotated_image = draw_ocr_overlay(image, result)
+        return result
 
     order = _AUTO_ORDER if engine == "auto" else [engine]
     last_err: Optional[Exception] = None
@@ -638,13 +775,20 @@ def extract_text_with_overlay(
                 if result.lines:
                     result.annotated_image = draw_ocr_overlay(image, result)
                     return result
+            elif name == "tesseract":
+                tess_lines = _ocr_tesseract_lines(image, languages, preprocess)
+                if tess_lines:
+                    result = OCRResult()
+                    result.lines = tess_lines
+                    # Tesseract lines have bboxes — draw overlay too.
+                    result.annotated_image = draw_ocr_overlay(image, result)
+                    return result
             else:
                 fn = _ENGINES.get(name)
                 if fn is None:
                     continue
                 text = fn(image, languages, preprocess)
                 if text and text.strip():
-                    # Non-ocrspace engines don't have overlay; wrap in OCRResult.
                     result = OCRResult()
                     for line in text.split("\n"):
                         if line.strip():
