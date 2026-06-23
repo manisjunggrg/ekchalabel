@@ -310,25 +310,45 @@ def _shrink_for_upload(image: Image.Image, max_bytes: int = 1_000_000) -> bytes:
 
 # ── OCR.space dual-engine with bounding boxes ────────────────────────────────
 
-def _ocrspace_call(image_bytes: bytes, engine_id: int, key: str) -> dict:
+def _ocrspace_call(
+    image_bytes: bytes,
+    engine_id: int,
+    key: str,
+    overlay: bool = True,
+    detect_orientation: bool = False,
+    filetype: str = "JPG",
+) -> dict:
     """Single OCR.space API call. Returns the raw JSON response."""
     import io
     import requests
 
+    data: dict = {
+        "language": "eng",
+        "OCREngine": engine_id,
+        "scale": True,
+        "isOverlayRequired": "true" if overlay else "false",
+        "detectOrientation": "true" if detect_orientation else "false",
+        "filetype": filetype,
+        "apikey": key,
+    }
     resp = requests.post(
         "https://api.ocr.space/parse/image",
         files={"label.jpg": ("label.jpg", io.BytesIO(image_bytes), "image/jpeg")},
-        data={
-            "language": "eng",
-            "OCREngine": engine_id,
-            "scale": True,
-            "isOverlayRequired": True,
-            "apikey": key,
-        },
-        timeout=45,
+        data=data,
+        timeout=60,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _plain_text_from_ocrspace(data: dict) -> str:
+    """Extract the plain ParsedText from an OCR.space response (no overlay needed)."""
+    parts: list[str] = []
+    for pr in data.get("ParsedResults", []):
+        t = pr.get("ParsedText", "")
+        if t:
+            parts.append(t)
+    return "\n".join(parts)
 
 
 def _parse_ocrspace_overlay(data: dict, engine_label: str) -> list[OCRLine]:
@@ -352,62 +372,152 @@ def _parse_ocrspace_overlay(data: dict, engine_label: str) -> list[OCRLine]:
     return lines_out
 
 
+def _normalise_line(text: str) -> str:
+    """Strip punctuation/spaces for fuzzy duplicate detection."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def _merge_lines(lines1: list[OCRLine], lines2: list[OCRLine]) -> list[OCRLine]:
     """
-    Merge OCR lines from two engines. Keep both unless they substantially
-    overlap (same text in nearly the same location), in which case keep the
-    higher-confidence one.
+    Merge OCR lines from two engines.
+
+    Engine 2 (photo) is the base. Lines from Engine 1 (table) are added
+    unless they are *normalised-text* duplicates of an already-accepted line.
+    Normalisation strips punctuation and spaces so "Total Fat 24g" and
+    "Total Fat 24 g" are treated as the same line, but "Fat 24g" and
+    "Saturated Fat 8g" are kept as distinct.
+
+    For nutrition lines specifically we prefer Engine 1 (table engine) because
+    it handles column-aligned numbers better — if both engines produced a line
+    for the same y-region, keep the Engine-1 version.
     """
+    # Build a fast normalised-text lookup from lines1 (E2 base).
+    seen_norm: dict[str, OCRLine] = {}
+    for ln in lines1:
+        seen_norm[_normalise_line(ln.text)] = ln
+
     merged: list[OCRLine] = list(lines1)
-    seen_texts = {ln.text.strip().lower() for ln in lines1}
+
     for ln in lines2:
-        key = ln.text.strip().lower()
-        if key in seen_texts:
-            continue  # duplicate text already covered
+        key = _normalise_line(ln.text)
+        if not key:
+            continue
+        if key in seen_norm:
+            # If E1 version is a nutrition line and existing isn't, prefer E1.
+            existing = seen_norm[key]
+            if _is_nutrition_line(ln.text) and not _is_nutrition_line(existing.text):
+                # Replace existing with better E1 version.
+                try:
+                    idx = merged.index(existing)
+                    merged[idx] = ln
+                    seen_norm[key] = ln
+                except ValueError:
+                    pass
+            continue  # duplicate — skip
         merged.append(ln)
-        seen_texts.add(key)
-    # Sort top-to-bottom by vertical position of the bbox.
+        seen_norm[key] = ln
+
+    # Sort top-to-bottom by vertical bbox position.
     merged.sort(key=lambda ln: (ln.bbox[1] if ln.bbox else 0))
     return merged
+
+
+def _prepare_table_crop(image: Image.Image) -> Image.Image:
+    """
+    High-contrast greyscale version of the image, tuned for OCR of
+    nutrition-facts tables (helps when the table has a white/light background).
+    """
+    from PIL import ImageEnhance
+    # Convert to greyscale, boost contrast aggressively, then back to RGB
+    # so OCR.space receives a standard colour image.
+    grey = ImageOps.grayscale(image)
+    grey = ImageOps.autocontrast(grey, cutoff=2)
+    grey = ImageEnhance.Contrast(grey).enhance(1.8)
+    grey = grey.filter(ImageFilter.SHARPEN)
+    # Upscale if small — tables need resolution.
+    w, h = grey.size
+    if max(w, h) < 2000:
+        scale = 2000 / max(w, h)
+        grey = grey.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    return grey.convert("RGB")
 
 
 def _ocr_ocrspace_with_overlay(
     image: Image.Image, languages: list[str], preprocess: bool,
 ) -> OCRResult:
     """
-    Run OCR.space Engine 1 (structured / table text) AND Engine 2 (photo text),
+    Run OCR.space Engine 2 (photo text) and Engine 1 (structured table text),
     merge results, and return bounding boxes for annotation.
+
+    Strategy:
+    - Engine 2 with overlay → good for curved/photographed text; gives bboxes.
+    - Engine 1 with overlay → good for table columns; gives bboxes.
+    - Engine 1 plain-text on table-enhanced image → extra pass to catch
+      nutrition rows that the overlay mode misses due to column alignment.
+    - orientation detection enabled so skewed labels are auto-rotated.
     """
     key = _ocrspace_key() or "helloworld"
 
     work, scale = _prepare_for_cloud_ocr(image) if preprocess else (image, 1.0)
     img_bytes = _shrink_for_upload(work)
 
+    # Also prepare a table-optimised version of the image.
+    table_work = _prepare_table_crop(image)
+    table_bytes = _shrink_for_upload(table_work)
+
     result = OCRResult()
     result._scale = scale
 
-    # ── Engine 2 first (better on photographed / curved text) ────────────
+    # ── Pass 1: Engine 2 with overlay (photo / curved text) ──────────────
+    lines2: list[OCRLine] = []
     try:
-        data2 = _ocrspace_call(img_bytes, engine_id=2, key=key)
+        data2 = _ocrspace_call(img_bytes, engine_id=2, key=key,
+                               overlay=True, detect_orientation=True)
         if data2.get("OCRExitCode") in (1, 2):
             lines2 = _parse_ocrspace_overlay(data2, "E2-photo")
-        else:
-            lines2 = []
     except Exception:
-        lines2 = []
+        pass
 
-    # ── Engine 1 (better on structured tables like nutrition facts) ──────
+    # ── Pass 2: Engine 1 with overlay on standard image (table columns) ──
+    lines1_overlay: list[OCRLine] = []
     try:
-        data1 = _ocrspace_call(img_bytes, engine_id=1, key=key)
+        data1 = _ocrspace_call(img_bytes, engine_id=1, key=key,
+                               overlay=True, detect_orientation=True)
         if data1.get("OCRExitCode") in (1, 2):
-            lines1 = _parse_ocrspace_overlay(data1, "E1-table")
-        else:
-            lines1 = []
+            lines1_overlay = _parse_ocrspace_overlay(data1, "E1-table")
     except Exception:
-        lines1 = []
+        pass
 
-    # Merge: Engine 2 as base (photo-focused), add unique lines from Engine 1.
-    result.lines = _merge_lines(lines2, lines1)
+    # ── Pass 3: Engine 1 plain-text on high-contrast table image ─────────
+    # This pass has no bboxes but often extracts table rows that the overlay
+    # mode misses when columns are close together or text is very small.
+    extra_lines: list[OCRLine] = []
+    try:
+        data1t = _ocrspace_call(table_bytes, engine_id=1, key=key,
+                                overlay=False, detect_orientation=False)
+        if data1t.get("OCRExitCode") in (1, 2):
+            plain = _plain_text_from_ocrspace(data1t)
+            for raw_line in plain.splitlines():
+                raw_line = raw_line.strip()
+                if raw_line:
+                    extra_lines.append(OCRLine(raw_line, bbox=None,
+                                               confidence=0, engine="E1-table-plain"))
+    except Exception:
+        pass
+
+    # ── Merge: E2 base → add E1 overlay → add E1 plain extras ───────────
+    merged = _merge_lines(lines2, lines1_overlay)
+    # For plain-text extras, only add lines NOT already in merged set.
+    seen_norm = {_normalise_line(ln.text) for ln in merged}
+    for ln in extra_lines:
+        key_n = _normalise_line(ln.text)
+        if key_n and key_n not in seen_norm:
+            merged.append(ln)
+            seen_norm.add(key_n)
+    # Re-sort: lines without bbox go after positioned lines.
+    merged.sort(key=lambda ln: (ln.bbox[1] if ln.bbox else float("inf")))
+
+    result.lines = merged
     return result
 
 
@@ -658,6 +768,32 @@ class TextZones:
         return self.full
 
 
+def _preprocess_ocr_text(text: str) -> str:
+    """
+    Normalise common OCR artifacts before zone splitting.
+
+    - Pipe characters that OCR reads from table column separators → space.
+    - Multiple spaces/tabs → single space.
+    - Lines that are pure percentage/number (e.g. "24%", "0 g") are kept
+      so nutrition rows aren't split across lines.
+    """
+    lines_out: list[str] = []
+    for line in text.splitlines():
+        # Replace pipe table separators with spaces.
+        line = line.replace("|", " ")
+        # Collapse repeated spaces/tabs.
+        line = re.sub(r"[ \t]{2,}", " ", line)
+        lines_out.append(line)
+    return "\n".join(lines_out)
+
+
+# How many consecutive non-nutrition lines to tolerate before exiting the
+# nutrition zone.  Nutrition tables often have lines like "% Daily Value"
+# or unit lines ("g", "%") that don't match _NUTRITION_ROW; we allow a
+# small run of them before deciding the table is over.
+_NUTRITION_ZONE_TOLERANCE = 3
+
+
 def split_text_zones(text: str) -> TextZones:
     """
     Split OCR text into nutrition-table, ingredient-list and other zones.
@@ -669,28 +805,38 @@ def split_text_zones(text: str) -> TextZones:
     Heuristic (line by line):
     1. Lines after an "Ingredients:" header → ingredient zone
        (until the next recognisable header or a blank line).
-    2. Lines matching nutrition table patterns (header or data rows
-       like "Total Fat 24g") → nutrition zone.
+    2. Lines after a Nutrition Facts header OR matching nutrition-row patterns
+       → nutrition zone.  A tolerance window (_NUTRITION_ZONE_TOLERANCE) lets
+       short non-matching lines (unit rows, "%" lines) stay in the nutrition
+       zone instead of prematurely ending it.
     3. Everything else → other zone.
     """
+    text = _preprocess_ocr_text(text)
     lines = text.split("\n")
     nut_lines: list[str] = []
     ing_lines: list[str] = []
     other_lines: list[str] = []
 
-    zone = "other"   # current zone state machine
+    zone = "other"
+    nut_miss_streak = 0  # consecutive non-nutrition lines while in nutrition zone
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
             if zone == "ingredients":
                 zone = "other"  # blank line ends ingredient list
+            # A blank line in nutrition zone counts against tolerance.
+            elif zone == "nutrition":
+                nut_miss_streak += 1
+                if nut_miss_streak > _NUTRITION_ZONE_TOLERANCE:
+                    zone = "other"
+                    nut_miss_streak = 0
             continue
 
-        # Check for zone-starting headers.
+        # ── Zone-starting headers ────────────────────────────────────────
         if _INGREDIENT_HEADERS.search(stripped):
             zone = "ingredients"
-            # The header line itself may contain ingredients after the colon.
+            nut_miss_streak = 0
             after_colon = re.split(r"[:;\-]\s*", stripped, maxsplit=1)
             if len(after_colon) > 1 and after_colon[1].strip():
                 ing_lines.append(after_colon[1].strip())
@@ -698,25 +844,42 @@ def split_text_zones(text: str) -> TextZones:
 
         if _NUTRITION_HEADERS.search(stripped):
             zone = "nutrition"
+            nut_miss_streak = 0
             continue
 
-        # Within the ingredient zone, keep accumulating.
+        # ── Ingredient zone accumulation ─────────────────────────────────
         if zone == "ingredients":
             ing_lines.append(stripped)
             continue
 
-        # Check if line looks like a nutrition table row.
+        # ── Nutrition zone ───────────────────────────────────────────────
         if _NUTRITION_ROW.search(stripped):
             nut_lines.append(stripped)
             zone = "nutrition"
+            nut_miss_streak = 0
             continue
 
-        # If we were in nutrition mode but this line doesn't match,
-        # the nutrition table has ended — fall through to other.
         if zone == "nutrition":
-            zone = "other"
+            # Tolerate short numeric/unit-only lines inside the table.
+            looks_like_table_fragment = bool(
+                re.match(r"^[\d\s%gmlkj./<>()]+$", stripped, re.IGNORECASE)
+                or len(stripped) <= 6
+            )
+            if looks_like_table_fragment:
+                nut_lines.append(stripped)
+                # Don't increment miss streak for these fragments.
+            else:
+                nut_miss_streak += 1
+                if nut_miss_streak > _NUTRITION_ZONE_TOLERANCE:
+                    zone = "other"
+                    nut_miss_streak = 0
+                    other_lines.append(stripped)
+                else:
+                    # Keep in nutrition zone tentatively.
+                    nut_lines.append(stripped)
+            continue
 
-        # Default: other.
+        # ── Default: other ───────────────────────────────────────────────
         other_lines.append(stripped)
 
     return TextZones(
@@ -797,37 +960,111 @@ def count_concerns(detected: list[dict]) -> tuple[int, int, int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NUTRIENT_PATTERNS: dict[str, list[str]] = {
-    "calories":  [r"(?:energy|calories?)[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(kcal|cal|kj)?"],
-    "sugar":     [r"sugars?\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)",
-                  r"sugars?\b[^\d\n]{0,6}(\d+(?:\.\d+)?)()"],
-    "fat":       [r"(?:total\s*fat|fat)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)",
-                  r"(?:total\s*fat|fat)\b[^\d\n]{0,6}(\d+(?:\.\d+)?)()"],
-    "sodium":    [r"(?:sodium|salt)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)"],
-    "protein":   [r"protein\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
-    "carbs":     [r"(?:carbohydrates?|carbs?)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
-    "fibre":     [r"(?:dietary\s*fibre|fibre|fiber)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
-    "saturated": [r"(?:saturated\s*fat|saturates)\b[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)?"],
+    # Calories / Energy: handle "240 kcal", "1004 kJ", "Cal 240", kJ→kcal later
+    "calories": [
+        r"(?:energy|calories?)\s*[:\|]?\s*(\d+(?:\.\d+)?)\s*(kcal|cal|kj)",
+        r"(?:energy|calories?)[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(kcal|cal|kj)?",
+        r"(\d{2,4})\s*(kcal|cal)\b",
+    ],
+    # Sugar: "Sugars 12g", "Total Sugars 12 g", "Of which sugars 12g"
+    "sugar": [
+        r"(?:total\s+)?sugars?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"of\s+which\s+sugars?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"sugars?\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)\s*(mg|g)?\b",
+    ],
+    # Fat: "Total Fat 24g", "Fat 24 g", handle pipe separators
+    "fat": [
+        r"total\s+fat\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"(?<!\w)fat\b[^\d\n|]{0,15}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"(?<!\w)fat\b[^\d\n|]{0,8}(\d+(?:\.\d+)?)()\b",
+    ],
+    # Sodium: "Sodium 480mg", "Salt 1.2g" — keep mg separate (don't auto-convert until parse)
+    "sodium": [
+        r"sodium\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"salt\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"sodium\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)(mg)?",
+    ],
+    # Protein
+    "protein": [
+        r"protein\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"protein\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)(g)?",
+    ],
+    # Carbohydrates
+    "carbs": [
+        r"(?:total\s+)?carbohydrates?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"carbs?\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)\s*(mg|g)?\b",
+    ],
+    # Dietary fibre/fiber
+    "fibre": [
+        r"dietary\s+fi[be]re?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"fi[be]re?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"fi[be]re?\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)(g)?",
+    ],
+    # Saturated fat
+    "saturated": [
+        r"saturated\s+fat\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"saturates?\b[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*(mg|g)\b",
+        r"saturated\b[^\d\n|]{0,10}(\d+(?:\.\d+)?)(g)?",
+    ],
 }
 
 
 def parse_nutritional_values(raw_text: str) -> dict[str, float]:
-    """Extract numeric nutritional values (per 100 g/ml). mg → g."""
-    text_lower = raw_text.lower()
+    """
+    Extract numeric nutritional values (per 100 g/ml).
+
+    Improvements over original:
+    - Tries matching on the raw text AND on a version where newlines between
+      short lines are collapsed (handles OCR that splits "Fat" / "24g" across
+      two lines).
+    - Converts mg → g for non-calorie nutrients.
+    - Converts kJ → kcal for energy (÷ 4.184).
+    - Skips values that are clearly %DV (followed by "%") rather than absolute.
+    """
     result = {k: 0.0 for k in _NUTRIENT_PATTERNS}
+
+    # Build two search targets: raw lower, and a single-line collapse
+    # (join lines that are short — pure numbers/units — to their predecessor).
+    raw_lower = raw_text.lower()
+    collapsed_lines: list[str] = []
+    for line in raw_lower.splitlines():
+        if collapsed_lines and re.match(r"^\s*[\d.]+\s*(?:g|mg|kcal|kj|cal)?\s*$", line):
+            collapsed_lines[-1] = collapsed_lines[-1].rstrip() + " " + line.strip()
+        else:
+            collapsed_lines.append(line)
+    collapsed_lower = "\n".join(collapsed_lines)
+
     for nutrient, patterns in _NUTRIENT_PATTERNS.items():
-        for pattern in patterns:
-            m = re.search(pattern, text_lower)
-            if not m:
-                continue
-            try:
-                value = float(m.group(1))
-            except (ValueError, IndexError):
-                continue
-            unit = m.group(2) if m.lastindex and m.lastindex >= 2 else ""
-            if unit == "mg" and nutrient != "calories":
-                value /= 1000.0
-            result[nutrient] = value
-            break
+        for target in (raw_lower, collapsed_lower):
+            for pattern in patterns:
+                m = re.search(pattern, target)
+                if not m:
+                    continue
+                try:
+                    value = float(m.group(1))
+                except (ValueError, IndexError):
+                    continue
+
+                # Skip if the match is immediately followed by "%" (it's a %DV).
+                end_ctx = target[m.end():m.end() + 3].strip()
+                if end_ctx.startswith("%"):
+                    continue
+
+                unit = (m.group(2) if m.lastindex and m.lastindex >= 2 else "") or ""
+                unit = unit.strip().lower()
+
+                if nutrient == "calories":
+                    if unit == "kj":
+                        value = value / 4.184  # kJ → kcal
+                elif unit == "mg":
+                    value /= 1000.0  # mg → g
+
+                if value > 0:
+                    result[nutrient] = value
+                    break  # found for this nutrient; stop trying patterns
+            if result[nutrient] > 0:
+                break  # found on first target; don't re-search collapsed
+
     return result
 
 
