@@ -196,6 +196,16 @@ with right:
             analysis: LabelAnalysis = analyze_label(image)
     except RuntimeError as e:
         st.error(str(e))
+        if "rate limit" in str(e).lower():
+            st.info("The Gemini free tier allows **15 requests per minute**. "
+                    "Wait a moment and click below to retry.")
+            if st.button("🔄 Retry"):
+                st.rerun()
+        st.stop()
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+        if st.button("🔄 Retry"):
+            st.rerun()
         st.stop()
 
     score = analysis.score
